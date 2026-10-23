@@ -15,6 +15,15 @@
 Kode terkait: `server/claudeReview.ts` (prompt, skema output, rate limit), `server/routers.ts` (`ai.status`, `ai.reviewToken`),
 `client/src/pages/Home.tsx` (UI review). Data kandidat masih simulasi di `client/src/data/mockScreening.ts`.
 
+## Password aplikasi
+
+- Password awal: **123456** (atau isi `APP_DEFAULT_PASSWORD`). Setelah login, banner kuning akan meminta Anda menggantinya.
+- Ganti password: **Pengaturan alert → Keamanan** (minimal 8 karakter). Sesi lain otomatis keluar.
+- Password disimpan sebagai hash di `DATA_DIR/app-auth.json` (default `./data`, di Docker `/data`).
+  **Di Railway/Render, pasang volume/disk persisten ke `/data`**; tanpa itu password kembali ke 123456 setiap redeploy.
+- Lupa password? Hapus `app-auth.json` di folder data lalu restart — password kembali ke awal.
+- Login dibatasi 10 percobaan gagal per 15 menit per IP. Endpoint Claude hanya bisa dipakai setelah login.
+
 > Catatan: mode `pnpm dev:static` hanya menyajikan frontend, jadi review AI butuh `pnpm dev` (server Express).
 
 ---

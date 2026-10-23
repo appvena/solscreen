@@ -18,7 +18,9 @@ import {
   Gauge,
   Globe2,
   LayoutDashboard,
+  KeyRound,
   Loader2,
+  LogOut,
   MessageCircle,
   PanelRight,
   Plus,
@@ -237,6 +239,11 @@ export default function Home() {
   const toastTimer = useRef<number | undefined>(undefined);
   const [reviews, setReviews] = useState<Record<string, ReviewResult>>({});
 
+  const utils = trpc.useUtils();
+  const session = trpc.appAuth.session.useQuery(undefined, { refetchOnWindowFocus: false });
+  const usingDefaultPassword = session.data?.usingDefaultPassword === true;
+  const [securityFocus, setSecurityFocus] = useState(false);
+  const logout = trpc.appAuth.logout.useMutation({ onSuccess: () => utils.invalidate() });
   const claudeStatus = trpc.ai.status.useQuery(undefined, { retry: false, refetchOnWindowFocus: false });
   const claudeReady = claudeStatus.data?.configured === true;
 
@@ -353,7 +360,7 @@ export default function Home() {
             <strong>Mode simulasi</strong>
             <span>{claudeReady ? "Claude aktif · data Solana belum live" : "Data Solana & Claude belum tersambung"}</span>
           </div>
-          <div className="profile-row"><div className="avatar">OP</div><div><strong>Operator</strong><span>Workspace pribadi</span></div></div>
+          <div className="profile-row"><div className="avatar">OP</div><div><strong>Operator</strong><span>Workspace pribadi</span></div><button type="button" className="icon-button small logout-button" title="Keluar" aria-label="Keluar" onClick={() => logout.mutate()} disabled={logout.isPending}><LogOut size={15} /></button></div>
         </div>
       </aside>
 
@@ -384,6 +391,14 @@ export default function Home() {
               <strong className={claudeReady ? "" : "pending"}>{claudeStatus.isLoading ? "memeriksa" : claudeReady ? "siap" : "belum diatur"}</strong>
             </div>
           </section>
+
+          {usingDefaultPassword && (
+            <section className="password-banner" role="alert">
+              <KeyRound size={16} />
+              <span><strong>Password masih bawaan.</strong> Siapa pun yang tahu password awal bisa masuk. Ganti sekarang supaya API key Claude Anda aman.</span>
+              <button type="button" className="primary-button" onClick={() => { setSecurityFocus(true); setSettingsOpen(true); }}>Ganti password</button>
+            </section>
+          )}
 
           <section className="simulation-banner" aria-label="Pemberitahuan data simulasi">
             <div className="scan-line" />
@@ -507,13 +522,16 @@ export default function Home() {
       {settingsOpen && (
         <SettingsDrawer
           initial={settings}
-          onClose={() => setSettingsOpen(false)}
+          onClose={() => { setSettingsOpen(false); setSecurityFocus(false); }}
           onSave={next => {
             setSettings(next);
             setSettingsOpen(false);
             notify(saveSettings(next) ? "Pengaturan alert disimpan di browser ini" : "Pengaturan diterapkan, tetapi browser menolak penyimpanan");
           }}
           notify={notify}
+          focusSecurity={securityFocus}
+          minPasswordLength={session.data?.minPasswordLength ?? 8}
+          onLogout={() => logout.mutate()}
         />
       )}
 
@@ -539,7 +557,15 @@ export default function Home() {
 // ---------------------------------------------------------------------------
 // Settings drawer — edits a draft; only "Simpan" applies and persists it.
 // ---------------------------------------------------------------------------
-function SettingsDrawer({ initial, onClose, onSave, notify }: { initial: AlertSettings; onClose: () => void; onSave: (settings: AlertSettings) => void; notify: (message: string) => void }) {
+function SettingsDrawer({ initial, onClose, onSave, notify, focusSecurity, minPasswordLength, onLogout }: {
+  initial: AlertSettings;
+  onClose: () => void;
+  onSave: (settings: AlertSettings) => void;
+  notify: (message: string) => void;
+  focusSecurity: boolean;
+  minPasswordLength: number;
+  onLogout: () => void;
+}) {
   const [draft, setDraft] = useState<AlertSettings>(initial);
   const [custom, setCustom] = useState("");
   const [customError, setCustomError] = useState("");
@@ -646,7 +672,63 @@ function SettingsDrawer({ initial, onClose, onSave, notify }: { initial: AlertSe
             <button type="button" className="primary-button" onClick={() => onSave(draft)}>Simpan</button>
           </div>
         </div>
+
+        <SecuritySection focus={focusSecurity} minLength={minPasswordLength} notify={notify} onLogout={onLogout} />
       </aside>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Security: change the shared app password, log out.
+// ---------------------------------------------------------------------------
+function SecuritySection({ focus, minLength, notify, onLogout }: { focus: boolean; minLength: number; notify: (message: string) => void; onLogout: () => void }) {
+  const utils = trpc.useUtils();
+  const ref = useRef<HTMLDivElement>(null);
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [localError, setLocalError] = useState("");
+  const change = trpc.appAuth.changePassword.useMutation({
+    onSuccess: result => {
+      setCurrent(""); setNext(""); setConfirm("");
+      void utils.appAuth.session.invalidate();
+      notify(result.persisted ? "Password berhasil diganti" : "Password diganti, tetapi server tidak bisa menyimpannya permanen — cek DATA_DIR");
+    },
+  });
+
+  useEffect(() => {
+    if (focus) window.setTimeout(() => {
+      ref.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      ref.current?.querySelector<HTMLInputElement>("input[type=password]")?.focus();
+    }, 120);
+  }, [focus]);
+
+  const submit = () => {
+    if (next.length < minLength) return setLocalError(`Password baru minimal ${minLength} karakter.`);
+    if (next !== confirm) return setLocalError("Konfirmasi password tidak sama.");
+    setLocalError("");
+    change.mutate({ current, next });
+  };
+  const error = localError || change.error?.message || "";
+
+  return (
+    <div className="setting-group security-group" ref={ref}>
+      <div className="setting-label">Keamanan</div>
+      <p className="setting-help">Satu password untuk semua orang yang membuka aplikasi ini. Mengganti password akan mengeluarkan sesi lain.</p>
+      <form className="password-form" noValidate onSubmit={event => { event.preventDefault(); submit(); }}>
+        <input type="text" name="username" autoComplete="username" value="solscreen" readOnly hidden />
+        <label>Password saat ini<input type="password" autoComplete="current-password" value={current} onChange={e => { setCurrent(e.target.value); setLocalError(""); change.reset(); }} /></label>
+        <label>Password baru<input type="password" autoComplete="new-password" value={next} onChange={e => { setNext(e.target.value); setLocalError(""); change.reset(); }} /></label>
+        <label>Ulangi password baru<input type="password" autoComplete="new-password" value={confirm} onChange={e => { setConfirm(e.target.value); setLocalError(""); change.reset(); }} /></label>
+        <div className="field-error" role="alert">{error}</div>
+        <div className="password-actions">
+          <button type="button" className="ghost-button" onClick={onLogout}><LogOut size={14} /> Keluar</button>
+          <button type="submit" className="primary-button" disabled={!current || !next || !confirm || change.isPending}>
+            {change.isPending ? <Loader2 size={14} className="spin" /> : <KeyRound size={14} />} Ganti password
+          </button>
+        </div>
+      </form>
     </div>
   );
 }

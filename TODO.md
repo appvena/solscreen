@@ -18,6 +18,11 @@
 - [x] Prompt melarang saran beli/jual; hasil berisi verdict, skor risiko, keyakinan, red flag, sinyal positif, data kurang, cek berikutnya.
 - [x] Test unit untuk status, validasi, parsing, dan rate limit.
 
+## Akses aplikasi
+- [x] Layar login dengan satu password bersama (awal 123456), sesi cookie bertanda tangan HMAC, 30 hari.
+- [x] Ganti password dari dalam aplikasi (hash scrypt, disimpan di DATA_DIR), keluar, banner peringatan password bawaan.
+- [x] Endpoint Claude hanya untuk sesi login; batas percobaan login.
+
 ## Alert dan pengaturan
 - [x] Ambang kenaikan preset (10/20/30%) + kustom 1–500% dengan validasi, bisa dihapus.
 - [x] Ambang penurunan, frekuensi, notifikasi push browser (meminta izin), Telegram ditandai "segera hadir".
@@ -27,4 +32,3 @@
 - [ ] Sambungkan provider data Solana (GeckoTerminal / DexScreener / RugCheck) dan kirim data live ke Claude.
 - [ ] Simpan hasil screening dan review ke database.
 - [ ] Pindahkan pengaturan ke backend; notifikasi push/Telegram dari server.
-- [ ] Batasi `ai.reviewToken` ke pengguna login bila aplikasi dibuka untuk publik.

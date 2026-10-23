@@ -43,3 +43,15 @@ export const adminProcedure = t.procedure.use(
     });
   }),
 );
+
+export const APP_LOGIN_REQUIRED_MSG = "Sesi berakhir. Silakan masuk lagi.";
+
+/** Requires the shared SolScreen app password session. */
+export const appProcedure = t.procedure.use(
+  t.middleware(async ({ ctx, next }) => {
+    if (!ctx.appAuthed) {
+      throw new TRPCError({ code: "UNAUTHORIZED", message: APP_LOGIN_REQUIRED_MSG });
+    }
+    return next();
+  }),
+);

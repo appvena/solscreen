@@ -5,12 +5,27 @@ import { Route, Switch } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider } from "./contexts/ThemeContext";
 import Home from "./pages/Home";
+import LoginScreen from "./components/LoginScreen";
+import { trpc } from "./lib/trpc";
+
+function AuthGate() {
+  const session = trpc.appAuth.session.useQuery(undefined, { retry: 1, refetchOnWindowFocus: true });
+  if (session.isLoading) return <div className="login-shell" aria-busy="true" />;
+  if (session.isError) {
+    return (
+      <div className="login-shell">
+        <div className="login-card"><h1 className="login-title">Server tidak terjangkau</h1><p className="login-copy">Coba muat ulang halaman beberapa saat lagi.</p></div>
+      </div>
+    );
+  }
+  return session.data?.authenticated ? <Home /> : <LoginScreen />;
+}
 
 function Router() {
   // make sure to consider if you need authentication for certain routes
   return (
     <Switch>
-      <Route path={"/"} component={Home} />
+      <Route path={"/"} component={AuthGate} />
       <Route path={"/404"} component={NotFound} />
       {/* Final fallback route */}
       <Route component={NotFound} />

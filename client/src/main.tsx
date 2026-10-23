@@ -10,9 +10,16 @@ import "./index.css";
 
 const queryClient = new QueryClient();
 
+const APP_LOGIN_REQUIRED_MSG = "Sesi berakhir. Silakan masuk lagi.";
+
 const redirectToLoginIfUnauthorized = (error: unknown) => {
   if (!(error instanceof TRPCClientError)) return;
   if (typeof window === "undefined") return;
+
+  if (error.message === APP_LOGIN_REQUIRED_MSG) {
+    void queryClient.invalidateQueries();
+    return;
+  }
 
   const isUnauthorized = error.message === UNAUTHED_ERR_MSG;
 

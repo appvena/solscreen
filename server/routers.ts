@@ -3,7 +3,19 @@ import { TRPCError } from "@trpc/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
-import { publicProcedure, router } from "./_core/trpc";
+import { z } from "zod";
+import { appProcedure, publicProcedure, router } from "./_core/trpc";
+import {
+  changePassword,
+  clearLoginFailures,
+  clearSessionCookie,
+  isUsingDefaultPassword,
+  loginBlocked,
+  MIN_PASSWORD_LENGTH,
+  recordLoginFailure,
+  setSessionCookie,
+  verifyPassword,
+} from "./appAuth";
 import {
   checkRateLimit,
   ClaudeNotConfiguredError,
@@ -26,12 +38,58 @@ export const appRouter = router({
     }),
   }),
 
+  /** Shared app password (login screen + change password in settings). */
+  appAuth: router({
+    session: publicProcedure.query(({ ctx }) => ({
+      authenticated: ctx.appAuthed,
+      usingDefaultPassword: ctx.appAuthed ? isUsingDefaultPassword() : false,
+      minPasswordLength: MIN_PASSWORD_LENGTH,
+    })),
+
+    login: publicProcedure
+      .input(z.object({ password: z.string().min(1).max(200) }))
+      .mutation(({ ctx, input }) => {
+        const key = ctx.req.ip ?? "anon";
+        if (loginBlocked(key)) {
+          throw new TRPCError({ code: "TOO_MANY_REQUESTS", message: "Terlalu banyak percobaan gagal. Coba lagi dalam 15 menit." });
+        }
+        if (!verifyPassword(input.password)) {
+          recordLoginFailure(key);
+          throw new TRPCError({ code: "UNAUTHORIZED", message: "Password salah." });
+        }
+        clearLoginFailures(key);
+        setSessionCookie(ctx.req, ctx.res);
+        return { ok: true, usingDefaultPassword: isUsingDefaultPassword() } as const;
+      }),
+
+    logout: publicProcedure.mutation(({ ctx }) => {
+      clearSessionCookie(ctx.req, ctx.res);
+      return { ok: true } as const;
+    }),
+
+    changePassword: appProcedure
+      .input(z.object({ current: z.string().min(1).max(200), next: z.string().max(200) }))
+      .mutation(({ ctx, input }) => {
+        const result = changePassword(input.current, input.next);
+        if (!result.ok) {
+          const message =
+            result.reason === "wrong_current" ? "Password saat ini salah." :
+            result.reason === "too_short" ? `Password baru minimal ${MIN_PASSWORD_LENGTH} karakter.` :
+            "Password baru harus berbeda dari yang sekarang.";
+          throw new TRPCError({ code: "BAD_REQUEST", message });
+        }
+        // Old sessions are now invalid; issue a fresh one for this browser.
+        setSessionCookie(ctx.req, ctx.res);
+        return { ok: true, persisted: result.persisted } as const;
+      }),
+  }),
+
   ai: router({
     /** Whether the Claude API key is configured (never returns the key itself). */
-    status: publicProcedure.query(() => getClaudeStatus()),
+    status: appProcedure.query(() => getClaudeStatus()),
 
     /** Ask Claude for a structured risk review of one screened token. */
-    reviewToken: publicProcedure.input(tokenReviewInput).mutation(async ({ ctx, input }) => {
+    reviewToken: appProcedure.input(tokenReviewInput).mutation(async ({ ctx, input }) => {
       if (!getClaudeStatus().configured) {
         throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Claude API belum dikonfigurasi. Isi ANTHROPIC_API_KEY di server." });
       }

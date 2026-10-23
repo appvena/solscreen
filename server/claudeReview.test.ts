@@ -14,7 +14,7 @@ const review = {
   redFlags: ["Top 10 holder 42%"], positiveSignals: ["Authority off"], missingData: ["Bubble map"], nextChecks: ["Cek holder di Solscan"],
 } as const;
 
-const ctx = (): TrpcContext => ({ user: null, req: { ip: "1.2.3.4", headers: {} } as TrpcContext["req"], res: {} as TrpcContext["res"] });
+const ctx = (appAuthed = true): TrpcContext => ({ user: null, appAuthed, req: { ip: "1.2.3.4", headers: {} } as TrpcContext["req"], res: {} as TrpcContext["res"] });
 
 afterEach(() => { vi.unstubAllEnvs(); resetRateLimit(); });
 
@@ -25,6 +25,12 @@ describe("Claude review", () => {
     const status = await appRouter.createCaller(ctx()).ai.status();
     expect(status).toEqual({ configured: true, model: "claude-sonnet-5-5" });
     expect(JSON.stringify(status)).not.toContain("sk-ant");
+  });
+
+  it("requires the app password session", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "test");
+    await expect(appRouter.createCaller(ctx(false)).ai.status()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(appRouter.createCaller(ctx(false)).ai.reviewToken(sample)).rejects.toMatchObject({ code: "UNAUTHORIZED" });
   });
 
   it("refuses to review when no API key is configured", async () => {

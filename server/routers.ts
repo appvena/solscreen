@@ -15,6 +15,7 @@ import {
   recordLoginFailure,
   setSessionCookie,
   verifyPassword,
+  authStorageKind,
 } from "./appAuth";
 import {
   checkRateLimit,
@@ -40,26 +41,32 @@ export const appRouter = router({
 
   /** Shared app password (login screen + change password in settings). */
   appAuth: router({
-    session: publicProcedure.query(({ ctx }) => ({
+    session: publicProcedure.query(async ({ ctx }) => ({
       authenticated: ctx.appAuthed,
-      usingDefaultPassword: ctx.appAuthed ? isUsingDefaultPassword() : false,
+      usingDefaultPassword: ctx.appAuthed ? await isUsingDefaultPassword() : false,
+      // On Vercel the filesystem is wiped, so a changed password only survives with Redis.
+      passwordPersistent: authStorageKind() === "redis" || !process.env.VERCEL,
       minPasswordLength: MIN_PASSWORD_LENGTH,
     })),
 
     login: publicProcedure
       .input(z.object({ password: z.string().min(1).max(200) }))
-      .mutation(({ ctx, input }) => {
+      .mutation(async ({ ctx, input }) => {
         const key = ctx.req.ip ?? "anon";
-        if (loginBlocked(key)) {
+        if (await loginBlocked(key)) {
           throw new TRPCError({ code: "TOO_MANY_REQUESTS", message: "Terlalu banyak percobaan gagal. Coba lagi dalam 15 menit." });
         }
-        if (!verifyPassword(input.password)) {
-          recordLoginFailure(key);
+        const valid = await verifyPassword(input.password).catch(error => {
+          console.error("[AppAuth] login gagal diproses", error);
+          throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Penyimpanan password tidak dapat diakses. Coba lagi sebentar." });
+        });
+        if (!valid) {
+          await recordLoginFailure(key);
           throw new TRPCError({ code: "UNAUTHORIZED", message: "Password salah." });
         }
-        clearLoginFailures(key);
-        setSessionCookie(ctx.req, ctx.res);
-        return { ok: true, usingDefaultPassword: isUsingDefaultPassword() } as const;
+        await clearLoginFailures(key);
+        await setSessionCookie(ctx.req, ctx.res);
+        return { ok: true, usingDefaultPassword: await isUsingDefaultPassword() } as const;
       }),
 
     logout: publicProcedure.mutation(({ ctx }) => {
@@ -69,8 +76,8 @@ export const appRouter = router({
 
     changePassword: appProcedure
       .input(z.object({ current: z.string().min(1).max(200), next: z.string().max(200) }))
-      .mutation(({ ctx, input }) => {
-        const result = changePassword(input.current, input.next);
+      .mutation(async ({ ctx, input }) => {
+        const result = await changePassword(input.current, input.next);
         if (!result.ok) {
           const message =
             result.reason === "wrong_current" ? "Password saat ini salah." :
@@ -79,7 +86,7 @@ export const appRouter = router({
           throw new TRPCError({ code: "BAD_REQUEST", message });
         }
         // Old sessions are now invalid; issue a fresh one for this browser.
-        setSessionCookie(ctx.req, ctx.res);
+        await setSessionCookie(ctx.req, ctx.res);
         return { ok: true, persisted: result.persisted } as const;
       }),
   }),

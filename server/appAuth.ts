@@ -1,13 +1,12 @@
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import path from "node:path";
 import { parse as parseCookie } from "cookie";
 import type { CookieOptions, Request, Response } from "express";
+import { getAuthStore, type StoredAuth } from "./authStore";
 
 // ---------------------------------------------------------------------------
 // Single shared app password.
 // - First start: password = APP_DEFAULT_PASSWORD or "123456".
-// - Changed from inside the app; stored as a scrypt hash in DATA_DIR/app-auth.json.
+// - Changed from inside the app; stored as a scrypt hash (Redis or file, see authStore).
 // - Sessions are HMAC-signed cookies; changing the password logs out every
 //   other session (the session carries the password "version").
 // ---------------------------------------------------------------------------
@@ -16,40 +15,14 @@ export const AUTH_COOKIE = "solscreen_auth";
 export const DEFAULT_PASSWORD_FALLBACK = "123456";
 export const MIN_PASSWORD_LENGTH = 8;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+/** How long a server instance trusts its cached copy before re-reading the store. */
+const CACHE_MS = 5_000;
 
-type StoredAuth = {
-  salt: string;
-  hash: string;
-  version: number;
-  secret: string;
-  isDefault: boolean;
-  updatedAt: string;
-};
-
-let state: StoredAuth | null = null;
-let persistWarned = false;
-
-const dataDir = () => process.env.DATA_DIR || path.resolve(process.cwd(), "data");
-const authFile = () => path.join(dataDir(), "app-auth.json");
+let cached: { value: StoredAuth; at: number; persisted: boolean } | null = null;
+let initPromise: Promise<StoredAuth> | null = null;
 
 function hashPassword(password: string, salt: string): string {
   return scryptSync(password, salt, 64).toString("hex");
-}
-
-function persist(next: StoredAuth): boolean {
-  try {
-    mkdirSync(dataDir(), { recursive: true });
-    const tmp = `${authFile()}.tmp`;
-    writeFileSync(tmp, JSON.stringify(next, null, 2), { mode: 0o600 });
-    renameSync(tmp, authFile());
-    return true;
-  } catch (error) {
-    if (!persistWarned) {
-      console.warn(`[AppAuth] Tidak bisa menyimpan ${authFile()} — password hanya tersimpan di memori sampai server restart.`, error);
-      persistWarned = true;
-    }
-    return false;
-  }
 }
 
 function freshState(password: string, isDefault: boolean, previous?: StoredAuth): StoredAuth {
@@ -58,53 +31,75 @@ function freshState(password: string, isDefault: boolean, previous?: StoredAuth)
     salt,
     hash: hashPassword(password, salt),
     version: (previous?.version ?? 0) + 1,
-    secret: process.env.SESSION_SECRET || previous?.secret || randomBytes(32).toString("hex"),
+    secret: previous?.secret || randomBytes(32).toString("hex"),
     isDefault,
     updatedAt: new Date().toISOString(),
   };
 }
 
-function load(): StoredAuth {
-  if (state) return state;
-  try {
-    const parsed = JSON.parse(readFileSync(authFile(), "utf8")) as StoredAuth;
-    if (parsed.salt && parsed.hash && parsed.secret && Number.isInteger(parsed.version)) {
-      state = { ...parsed, secret: process.env.SESSION_SECRET || parsed.secret };
-      return state;
+const withEnvSecret = (value: StoredAuth): StoredAuth => ({ ...value, secret: process.env.SESSION_SECRET || value.secret });
+
+async function load(): Promise<StoredAuth> {
+  if (cached && Date.now() - cached.at < CACHE_MS) return cached.value;
+  if (initPromise) return initPromise;
+  initPromise = (async () => {
+    const store = getAuthStore();
+    let value: StoredAuth | null;
+    try {
+      value = await store.read();
+    } catch (error) {
+      // Never fall back to the default password on a read error: that could
+      // overwrite a changed password. Reuse the last known state, or fail closed.
+      console.error("[AppAuth] Gagal membaca penyimpanan password", error);
+      if (cached) return cached.value;
+      throw new Error("Penyimpanan password tidak dapat diakses.");
     }
-  } catch {
-    // Missing or unreadable: initialise below.
+    let persisted = true;
+    if (!value || !value.salt || !value.hash || !value.secret) {
+      value = freshState(process.env.APP_DEFAULT_PASSWORD || DEFAULT_PASSWORD_FALLBACK, true);
+      persisted = await store.write(value).catch(() => false);
+    }
+    cached = { value: withEnvSecret(value), at: Date.now(), persisted };
+    return cached.value;
+  })();
+  try {
+    return await initPromise;
+  } finally {
+    initPromise = null;
   }
-  state = freshState(process.env.APP_DEFAULT_PASSWORD || DEFAULT_PASSWORD_FALLBACK, true);
-  persist(state);
-  return state;
 }
 
-/** Test helper: forget cached state so the next call re-reads DATA_DIR. */
+/** Test helper: forget cached state so the next call re-reads the store. */
 export function resetAppAuthForTests() {
-  state = null;
-  persistWarned = false;
+  cached = null;
+  initPromise = null;
 }
 
-export function verifyPassword(password: string): boolean {
-  const current = load();
+export async function verifyPassword(password: string): Promise<boolean> {
+  const current = await load();
   const candidate = Buffer.from(hashPassword(password, current.salt), "hex");
   const expected = Buffer.from(current.hash, "hex");
   return candidate.length === expected.length && timingSafeEqual(candidate, expected);
 }
 
-export function isUsingDefaultPassword(): boolean {
-  return load().isDefault;
+export async function isUsingDefaultPassword(): Promise<boolean> {
+  return (await load()).isDefault;
 }
 
 export type ChangeResult = { ok: true; persisted: boolean } | { ok: false; reason: "wrong_current" | "too_short" | "same_as_current" };
 
-export function changePassword(current: string, next: string): ChangeResult {
-  if (!verifyPassword(current)) return { ok: false, reason: "wrong_current" };
+export async function changePassword(current: string, next: string): Promise<ChangeResult> {
+  if (!(await verifyPassword(current))) return { ok: false, reason: "wrong_current" };
   if (next.length < MIN_PASSWORD_LENGTH) return { ok: false, reason: "too_short" };
   if (next === current) return { ok: false, reason: "same_as_current" };
-  state = freshState(next, false, load());
-  return { ok: true, persisted: persist(state) };
+  const previous = await load();
+  const value = freshState(next, false, previous);
+  const persisted = await getAuthStore().write(value).catch(error => {
+    console.error("[AppAuth] Gagal menyimpan password baru", error);
+    return false;
+  });
+  cached = { value: withEnvSecret(value), at: Date.now(), persisted };
+  return { ok: true, persisted };
 }
 
 // --- Session tokens --------------------------------------------------------
@@ -112,17 +107,17 @@ function sign(payload: string, secret: string) {
   return createHmac("sha256", secret).update(payload).digest("base64url");
 }
 
-export function createSessionToken(now = Date.now()): string {
-  const { version, secret } = load();
+export async function createSessionToken(now = Date.now()): Promise<string> {
+  const { version, secret } = await load();
   const payload = Buffer.from(JSON.stringify({ v: version, exp: now + SESSION_TTL_MS })).toString("base64url");
   return `${payload}.${sign(payload, secret)}`;
 }
 
-export function verifySessionToken(token: string | undefined, now = Date.now()): boolean {
+export async function verifySessionToken(token: string | undefined, now = Date.now()): Promise<boolean> {
   if (!token) return false;
   const [payload, signature] = token.split(".");
   if (!payload || !signature) return false;
-  const { version, secret } = load();
+  const { version, secret } = await load();
   const expected = Buffer.from(sign(payload, secret));
   const given = Buffer.from(signature);
   if (expected.length !== given.length || !timingSafeEqual(expected, given)) return false;
@@ -134,10 +129,15 @@ export function verifySessionToken(token: string | undefined, now = Date.now()):
   }
 }
 
-export function isRequestAuthenticated(req: Pick<Request, "headers">): boolean {
+export async function isRequestAuthenticated(req: Pick<Request, "headers">): Promise<boolean> {
   const header = req.headers?.cookie;
   if (!header) return false;
-  return verifySessionToken(parseCookie(header)[AUTH_COOKIE]);
+  try {
+    return await verifySessionToken(parseCookie(header)[AUTH_COOKIE]);
+  } catch (error) {
+    console.error("[AppAuth] Gagal memeriksa sesi", error);
+    return false;
+  }
 }
 
 function cookieOptions(req: Request): CookieOptions {
@@ -150,8 +150,8 @@ function cookieOptions(req: Request): CookieOptions {
   };
 }
 
-export function setSessionCookie(req: Request, res: Response) {
-  res.cookie(AUTH_COOKIE, createSessionToken(), cookieOptions(req));
+export async function setSessionCookie(req: Request, res: Response) {
+  res.cookie(AUTH_COOKIE, await createSessionToken(), cookieOptions(req));
 }
 
 export function clearSessionCookie(req: Request, res: Response) {
@@ -162,20 +162,20 @@ export function clearSessionCookie(req: Request, res: Response) {
 // --- Brute-force protection for login -------------------------------------
 const FAIL_WINDOW_MS = 15 * 60 * 1000;
 const MAX_FAILS = 10;
-const failures = new Map<string, number[]>();
 
-export function loginBlocked(key: string, now = Date.now()): boolean {
-  const recent = (failures.get(key) ?? []).filter(t => now - t < FAIL_WINDOW_MS);
-  failures.set(key, recent);
-  return recent.length >= MAX_FAILS;
+export async function loginBlocked(key: string): Promise<boolean> {
+  return (await getAuthStore().failures(key, FAIL_WINDOW_MS).catch(() => 0)) >= MAX_FAILS;
 }
 
-export function recordLoginFailure(key: string, now = Date.now()) {
-  const recent = (failures.get(key) ?? []).filter(t => now - t < FAIL_WINDOW_MS);
-  recent.push(now);
-  failures.set(key, recent);
+export async function recordLoginFailure(key: string): Promise<void> {
+  await getAuthStore().addFailure(key, FAIL_WINDOW_MS).catch(() => 0);
 }
 
-export function clearLoginFailures(key: string) {
-  failures.delete(key);
+export async function clearLoginFailures(key: string): Promise<void> {
+  await getAuthStore().clearFailures(key).catch(() => undefined);
+}
+
+/** For the health panel: where the password is kept. */
+export function authStorageKind() {
+  return getAuthStore().kind;
 }

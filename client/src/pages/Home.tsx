@@ -531,6 +531,7 @@ export default function Home() {
           notify={notify}
           focusSecurity={securityFocus}
           minPasswordLength={session.data?.minPasswordLength ?? 8}
+          passwordPersistent={session.data?.passwordPersistent !== false}
           onLogout={() => logout.mutate()}
         />
       )}
@@ -557,13 +558,14 @@ export default function Home() {
 // ---------------------------------------------------------------------------
 // Settings drawer — edits a draft; only "Simpan" applies and persists it.
 // ---------------------------------------------------------------------------
-function SettingsDrawer({ initial, onClose, onSave, notify, focusSecurity, minPasswordLength, onLogout }: {
+function SettingsDrawer({ initial, onClose, onSave, notify, focusSecurity, minPasswordLength, passwordPersistent, onLogout }: {
   initial: AlertSettings;
   onClose: () => void;
   onSave: (settings: AlertSettings) => void;
   notify: (message: string) => void;
   focusSecurity: boolean;
   minPasswordLength: number;
+  passwordPersistent: boolean;
   onLogout: () => void;
 }) {
   const [draft, setDraft] = useState<AlertSettings>(initial);
@@ -673,7 +675,7 @@ function SettingsDrawer({ initial, onClose, onSave, notify, focusSecurity, minPa
           </div>
         </div>
 
-        <SecuritySection focus={focusSecurity} minLength={minPasswordLength} notify={notify} onLogout={onLogout} />
+        <SecuritySection focus={focusSecurity} minLength={minPasswordLength} persistent={passwordPersistent} notify={notify} onLogout={onLogout} />
       </aside>
     </div>
   );
@@ -682,7 +684,7 @@ function SettingsDrawer({ initial, onClose, onSave, notify, focusSecurity, minPa
 // ---------------------------------------------------------------------------
 // Security: change the shared app password, log out.
 // ---------------------------------------------------------------------------
-function SecuritySection({ focus, minLength, notify, onLogout }: { focus: boolean; minLength: number; notify: (message: string) => void; onLogout: () => void }) {
+function SecuritySection({ focus, minLength, persistent, notify, onLogout }: { focus: boolean; minLength: number; persistent: boolean; notify: (message: string) => void; onLogout: () => void }) {
   const utils = trpc.useUtils();
   const ref = useRef<HTMLDivElement>(null);
   const [current, setCurrent] = useState("");
@@ -693,7 +695,7 @@ function SecuritySection({ focus, minLength, notify, onLogout }: { focus: boolea
     onSuccess: result => {
       setCurrent(""); setNext(""); setConfirm("");
       void utils.appAuth.session.invalidate();
-      notify(result.persisted ? "Password berhasil diganti" : "Password diganti, tetapi server tidak bisa menyimpannya permanen — cek DATA_DIR");
+      notify(result.persisted ? "Password berhasil diganti" : "Password diganti, tetapi belum tersimpan permanen — hubungkan Upstash Redis");
     },
   });
 
@@ -716,6 +718,7 @@ function SecuritySection({ focus, minLength, notify, onLogout }: { focus: boolea
     <div className="setting-group security-group" ref={ref}>
       <div className="setting-label">Keamanan</div>
       <p className="setting-help">Satu password untuk semua orang yang membuka aplikasi ini. Mengganti password akan mengeluarkan sesi lain.</p>
+      {!persistent && <div className="ai-error storage-warning"><AlertTriangle size={14} /> Penyimpanan Upstash Redis belum dihubungkan di Vercel — password yang diganti bisa kembali ke awal.</div>}
       <form className="password-form" noValidate onSubmit={event => { event.preventDefault(); submit(); }}>
         <input type="text" name="username" autoComplete="username" value="solscreen" readOnly hidden />
         <label>Password saat ini<input type="password" autoComplete="current-password" value={current} onChange={e => { setCurrent(e.target.value); setLocalError(""); change.reset(); }} /></label>

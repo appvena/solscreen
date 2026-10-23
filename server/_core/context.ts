@@ -27,6 +27,6 @@ export async function createContext(
     req: opts.req,
     res: opts.res,
     user,
-    appAuthed: isRequestAuthenticated(opts.req),
+    appAuthed: await isRequestAuthenticated(opts.req),
   };
 }

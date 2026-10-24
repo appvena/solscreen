@@ -28,6 +28,12 @@
 - [x] Ambang penurunan, frekuensi, notifikasi push browser (meminta izin), Telegram ditandai "segera hadir".
 - [x] Pengaturan disimpan di localStorage (draft → Simpan/Batal/Reset).
 
+## Data live & Claude
+- [x] Screening live: token ≤24 jam, < Rp1, likuiditas ≥ $10K, authority off, dev ≤3%, top-10 ≤30%, tanpa cluster insider, media sosial.
+- [x] Review Claude otomatis (Haiku + riset web) untuk kandidat teratas, cache 24 jam; review mendalam (Sonnet).
+- [x] Meter kredit Claude (pemakaian × harga resmi) + saldo dari Console.
+- [x] PWA: manifest, ikon, service worker.
+
 ## Berikutnya
 - [ ] Sambungkan provider data Solana (GeckoTerminal / DexScreener / RugCheck) dan kirim data live ke Claude.
 - [ ] Simpan hasil screening dan review ke database.

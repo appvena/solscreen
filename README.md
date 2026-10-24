@@ -1,5 +1,14 @@
 # SolScreen — Intelijen Token Solana
 
+Dashboard screening token **baru** Solana (≤24 jam, harga < Rp1) dengan data live:
+GeckoTerminal (pool baru) + DexScreener (harga, likuiditas, media sosial) + RugCheck (authority, wallet dev,
+distribusi holder, jaringan insider sebagai pengganti bubble map). Kandidat yang lolos ditinjau Claude
+(otomatis: `claude-haiku-5-5` + pencarian web untuk media sosial & rencana proyek; "Review mendalam": `CLAUDE_MODEL`).
+Bukan saran investasi. Kode screening: `server/screening/`, Claude: `server/claudeReview.ts`, meter kredit: `server/usage.ts`.
+
+Variabel opsional: `CLAUDE_AUTO_MODEL`, `CLAUDE_MODEL`, `CLAUDE_WEB_SEARCH=off`, `CLAUDE_DAILY_REVIEW_LIMIT` (default 60 review baru/hari).
+Hubungkan Upstash Redis agar cache review, meter kredit, dan ganti password dari web tersimpan permanen.
+
 ## Deploy ke Vercel (gratis, tanpa kartu kredit)
 
 1. Di https://vercel.com/new pilih `appvena/solscreen`, Application Preset **Other**, klik **Deploy**.

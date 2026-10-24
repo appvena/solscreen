@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode, RefObject } from "react";
+import type { inferRouterOutputs } from "@trpc/server";
 import {
   Activity,
   AlertTriangle,
@@ -11,18 +12,17 @@ import {
   ChevronRight,
   CircleHelp,
   Clock3,
-  Code2,
+  Coins,
   Copy,
   Database,
+  ExternalLink,
   Filter,
-  Gauge,
   Globe2,
-  LayoutDashboard,
   KeyRound,
+  LayoutDashboard,
   Loader2,
   LogOut,
   MessageCircle,
-  PanelRight,
   Plus,
   Radio,
   RefreshCw,
@@ -35,15 +35,15 @@ import {
   Zap,
 } from "lucide-react";
 import { trpc } from "@/lib/trpc";
-import {
-  alerts,
-  candidates,
-  screeningSummary,
-  type Candidate,
-  type CandidateStatus,
-  type Risk,
-  type Tone,
-} from "@/data/mockScreening";
+import type { AppRouter } from "../../../server/routers";
+
+type Outputs = inferRouterOutputs<AppRouter>;
+type Screening = Outputs["screening"]["today"];
+type Candidate = Screening["candidates"][number];
+type Review = NonNullable<Outputs["ai"]["review"]>;
+type Usage = Outputs["ai"]["usage"];
+type Tone = "good" | "warn" | "bad";
+type Status = Candidate["status"];
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
@@ -59,9 +59,21 @@ const formatAgo = (minutes: number) => {
   return hours < 24 ? `${hours} jam lalu` : `${Math.floor(hours / 24)} hari lalu`;
 };
 const pad2 = (value: number) => String(value).padStart(2, "0");
+const formatIdr = (v: number) => `Rp${v.toLocaleString("id-ID", { maximumSignificantDigits: 4 })}`;
+const formatUsdPrice = (v: number) => `$${v.toLocaleString("en-US", { maximumSignificantDigits: 4 })}`;
+const formatUsdShort = (v: number | null) => v === null ? "—" : v >= 1e6 ? `$${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `$${(v / 1e3).toFixed(1)}K` : `$${v.toFixed(0)}`;
+const formatUsdMoney = (v: number) => `US$${v.toLocaleString("id-ID", { minimumFractionDigits: 2, maximumFractionDigits: v < 1 ? 4 : 2 })}`;
+const shortMint = (mint: string) => `${mint.slice(0, 4)}...${mint.slice(-4)}`;
+const fmtChange = (v: number | null) => v === null ? "—" : `${v >= 0 ? "+" : ""}${v.toLocaleString("id-ID", { maximumFractionDigits: 1 })}%`;
+const accentFor = (mint: string) => {
+  const palette = ["#b7ef5e", "#8fa7ff", "#f3a55e", "#6fd3c1", "#e58fd0", "#f2d36b"];
+  let h = 0;
+  for (const ch of mint) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return palette[h % palette.length];
+};
 
-const RISK_LABEL: Record<Risk, string> = { Low: "Risiko rendah", Medium: "Risiko sedang", High: "Risiko tinggi" };
-const STATUS_LABEL: Record<CandidateStatus, string> = { Review: "Review", Watch: "Pantau", Rejected: "Ditolak" };
+const STATUS_CLASS: Record<Status, string> = { Lolos: "review", Pantau: "watch", Ditolak: "rejected" };
+const RISK_LABEL: Record<Candidate["risk"], string> = { Low: "Risiko rendah", Medium: "Risiko sedang", High: "Risiko tinggi" };
 
 // ---------------------------------------------------------------------------
 // Persisted alert settings (localStorage, per browser)
@@ -71,11 +83,12 @@ type AlertSettings = {
   downThreshold: number;
   frequencyMinutes: 1 | 5 | 15;
   push: boolean;
+  autoReview: boolean;
 };
 
 const SETTINGS_KEY = "solscreen.alertSettings.v1";
 const PRESET_THRESHOLDS = [10, 20, 30];
-const DEFAULT_SETTINGS: AlertSettings = { thresholds: [10, 20, 30], downThreshold: 10, frequencyMinutes: 5, push: false };
+const DEFAULT_SETTINGS: AlertSettings = { thresholds: [10, 20, 30], downThreshold: 10, frequencyMinutes: 5, push: false, autoReview: true };
 
 function loadSettings(): AlertSettings {
   try {
@@ -90,6 +103,7 @@ function loadSettings(): AlertSettings {
       downThreshold: Number.isInteger(parsed.downThreshold) && parsed.downThreshold! >= 1 && parsed.downThreshold! <= 50 ? parsed.downThreshold! : DEFAULT_SETTINGS.downThreshold,
       frequencyMinutes: parsed.frequencyMinutes === 1 || parsed.frequencyMinutes === 15 ? parsed.frequencyMinutes : 5,
       push: parsed.push === true,
+      autoReview: parsed.autoReview !== false,
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -200,6 +214,7 @@ function Switch({ checked, onChange, disabled, label }: { checked: boolean; onCh
   );
 }
 
+
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
@@ -211,33 +226,38 @@ const NAV_MONITOR: { key: NavKey; label: string; icon: typeof LayoutDashboard }[
 ];
 const NAV_LABEL: Record<NavKey, string> = { overview: "Ringkasan", candidates: "Kandidat", alerts: "Alert", sources: "Sumber data" };
 
-type ReviewResult = {
-  verdict: "layak_dipantau" | "perlu_review_manual" | "hindari";
-  riskScore: number;
-  confidence: number;
-  summary: string;
-  redFlags: string[];
-  positiveSignals: string[];
-  missingData: string[];
-  nextChecks: string[];
-  model: string;
-  reviewedAt: string;
-};
+type AlertEvent = { key: string; symbol: string; mint: string; trigger: string; move: number; kind: "up" | "down" };
+
+function deriveAlerts(candidates: Candidate[], settings: AlertSettings): AlertEvent[] {
+  const events: AlertEvent[] = [];
+  const up = [...settings.thresholds].sort((a, b) => b - a);
+  for (const c of candidates) {
+    const h1 = c.change.h1;
+    if (h1 === null) continue;
+    const hit = up.find(t => h1 >= t);
+    if (hit !== undefined) events.push({ key: `${c.mint}:up${hit}`, symbol: c.symbol, mint: c.mint, trigger: `Naik melewati +${hit}% (1 jam)`, move: h1, kind: "up" });
+    else if (h1 <= -settings.downThreshold) events.push({ key: `${c.mint}:down${settings.downThreshold}`, symbol: c.symbol, mint: c.mint, trigger: `Turun melewati −${settings.downThreshold}% (1 jam)`, move: h1, kind: "down" });
+  }
+  return events.sort((a, b) => Math.abs(b.move) - Math.abs(a.move));
+}
+
+const AUTO_REVIEW_MAX = 8;
 
 export default function Home() {
   const [activeNav, setActiveNav] = useState<NavKey>("overview");
   const [query, setQuery] = useState("");
-  const [riskFilter, setRiskFilter] = useState<"All" | Risk>("All");
-  const [selected, setSelected] = useState<Candidate | null>(null);
+  const [statusFilter, setStatusFilter] = useState<"All" | Status>("All");
+  const [selectedMint, setSelectedMint] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<AlertSettings>(() => loadSettings());
-  const [lastSync, setLastSync] = useState(() => new Date());
-  const [unreadAlerts, setUnreadAlerts] = useState(alerts.length);
-  const [showScoring, setShowScoring] = useState(false);
-  const [showChecklist, setShowChecklist] = useState(false);
+  const [showRejected, setShowRejected] = useState(false);
+  const [readAlerts, setReadAlerts] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState("");
   const toastTimer = useRef<number | undefined>(undefined);
-  const [reviews, setReviews] = useState<Record<string, ReviewResult>>({});
+  const [reviews, setReviews] = useState<Record<string, Review>>({});
+  const [reviewing, setReviewing] = useState<Record<string, boolean>>({});
+  const [reviewErrors, setReviewErrors] = useState<Record<string, string>>({});
+  const [refreshing, setRefreshing] = useState(false);
 
   const utils = trpc.useUtils();
   const session = trpc.appAuth.session.useQuery(undefined, { refetchOnWindowFocus: false });
@@ -246,22 +266,16 @@ export default function Home() {
   const logout = trpc.appAuth.logout.useMutation({ onSuccess: () => utils.invalidate() });
   const claudeStatus = trpc.ai.status.useQuery(undefined, { retry: false, refetchOnWindowFocus: false });
   const claudeReady = claudeStatus.data?.configured === true;
-
-  const filtered = useMemo(
-    () =>
-      candidates.filter(candidate => {
-        const matchesQuery = `${candidate.name} ${candidate.symbol} ${candidate.mint}`.toLowerCase().includes(query.trim().toLowerCase());
-        const matchesRisk = riskFilter === "All" || candidate.risk === riskFilter;
-        return matchesQuery && matchesRisk;
-      }),
-    [query, riskFilter],
-  );
-
-  const today = dateFmt.format(lastSync).toUpperCase();
-  const scannedDelta = screeningSummary.scanned - screeningSummary.scannedYesterday;
-  const rejectedCount = screeningSummary.scanned - screeningSummary.passed;
-  const pct = (part: number) => ((part / screeningSummary.scanned) * 100).toFixed(1).replace(".", ",");
-  const watchCount = candidates.filter(c => c.status !== "Rejected").length;
+  const usage = trpc.ai.usage.useQuery(undefined, { refetchOnWindowFocus: false, refetchInterval: 60_000 });
+  const screening = trpc.screening.today.useQuery(undefined, {
+    refetchOnWindowFocus: false,
+    staleTime: 5 * 60_000,
+    refetchInterval: Math.max(settings.frequencyMinutes, 5) * 60_000,
+    retry: 1,
+  });
+  const data = screening.data;
+  const candidates = useMemo(() => data?.candidates ?? [], [data]);
+  const lastSync = data ? new Date(data.generatedAt) : null;
 
   const notify = useCallback((message: string) => {
     window.clearTimeout(toastTimer.current);
@@ -270,27 +284,110 @@ export default function Home() {
   }, []);
   useEffect(() => () => window.clearTimeout(toastTimer.current), []);
 
+  const filtered = useMemo(
+    () =>
+      candidates.filter(c => {
+        const matchesQuery = `${c.name} ${c.symbol} ${c.mint}`.toLowerCase().includes(query.trim().toLowerCase());
+        return matchesQuery && (statusFilter === "All" || c.status === statusFilter);
+      }),
+    [candidates, query, statusFilter],
+  );
+  const counts = useMemo(() => ({
+    lolos: candidates.filter(c => c.status === "Lolos").length,
+    pantau: candidates.filter(c => c.status === "Pantau").length,
+  }), [candidates]);
+
+  const alerts = useMemo(() => deriveAlerts(candidates, settings), [candidates, settings]);
+  const unreadAlerts = alerts.filter(a => !readAlerts.has(a.key)).length;
+
+  // Browser push for new alerts (only when enabled and permitted).
+  const notifiedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!settings.push || typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    for (const a of alerts) {
+      if (notifiedRef.current.has(a.key)) continue;
+      notifiedRef.current.add(a.key);
+      try {
+        new Notification(`SolScreen · ${a.symbol}`, { body: `${a.trigger}: ${fmtChange(a.move)}`, icon: "/icons/icon-192.png", tag: a.key });
+      } catch {
+        // Some mobile browsers only allow notifications from the service worker.
+      }
+    }
+  }, [alerts, settings.push]);
+
+  // --- Claude reviews: load cached ones, then auto-review new candidates. ---
+  const runReview = useCallback(async (mint: string, mode: "auto" | "deep", cachedOnly = false) => {
+    if (!cachedOnly) setReviewing(r => ({ ...r, [mint]: true }));
+    setReviewErrors(e => { const { [mint]: _drop, ...rest } = e; return rest; });
+    try {
+      const result = await utils.client.ai.review.mutate({ mint, mode, cachedOnly });
+      if (result) setReviews(r => (mode === "auto" && r[mint]?.mode === "deep" ? r : { ...r, [mint]: result }));
+      return result;
+    } catch (error) {
+      if (!cachedOnly) setReviewErrors(e => ({ ...e, [mint]: error instanceof Error ? error.message : "Review gagal" }));
+      return null;
+    } finally {
+      if (!cachedOnly) {
+        setReviewing(r => ({ ...r, [mint]: false }));
+        void utils.ai.usage.invalidate();
+      }
+    }
+  }, [utils]);
+
+  const reviewsRef = useRef(reviews);
+  reviewsRef.current = reviews;
+  const autoRanFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!data || autoRanFor.current === data.generatedAt) return;
+    autoRanFor.current = data.generatedAt;
+    const mints = data.candidates.slice(0, AUTO_REVIEW_MAX).map(c => c.mint);
+    void (async () => {
+      // 1) cached reviews (deep first, then auto) — free
+      for (const mint of mints) {
+        const deep = await runReview(mint, "deep", true);
+        if (!deep) await runReview(mint, "auto", true);
+      }
+      // 2) new automatic reviews, two at a time
+      if (!claudeReady || !settings.autoReview) return;
+      const pending = mints.filter(m => !reviewsRef.current[m]);
+      for (let i = 0; i < pending.length; i += 2) {
+        await Promise.all(pending.slice(i, i + 2).map(m => runReview(m, "auto")));
+      }
+    })();
+  }, [data, claudeReady, settings.autoReview, runReview]);
+
+  const refresh = async () => {
+    setRefreshing(true);
+    try {
+      const fresh = await utils.screening.today.fetch({ force: true });
+      utils.screening.today.setData(undefined, fresh);
+      notify(`Data diperbarui · ${fresh.candidates.length} kandidat`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Gagal memuat ulang");
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
   const copyMint = async (mint: string) => {
     try {
       await navigator.clipboard.writeText(mint);
-      notify(`Alamat ${mint} disalin`);
+      notify(`Alamat ${shortMint(mint)} disalin`);
     } catch {
       notify("Gagal menyalin — izin clipboard ditolak browser");
     }
   };
 
+  const navLockUntil = useRef(0);
   const goTo = (key: NavKey) => {
     setActiveNav(key);
     navLockUntil.current = Date.now() + 1200;
-    if (key === "alerts") setUnreadAlerts(0);
+    if (key === "alerts") setReadAlerts(new Set(alerts.map(a => a.key)));
     const target = key === "overview" ? null : document.getElementById(`section-${key}`);
     if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
     else window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
-  // Highlight the nav item for the section currently in view. A click locks the
-  // highlight briefly so smooth scrolling past other sections doesn't override it.
-  const navLockUntil = useRef(0);
   useEffect(() => {
     const ids: NavKey[] = ["candidates", "sources", "alerts"];
     const onScroll = () => {
@@ -308,23 +405,22 @@ export default function Home() {
     return () => window.removeEventListener("scroll", onScroll);
   }, []);
 
-  const refresh = () => {
-    setLastSync(new Date());
-    notify("Data simulasi dimuat ulang — belum ada sumber live");
-  };
-
-  const sources: { name: string; meta: string; tone: Tone }[] = [
-    { name: "Pool Solana", meta: "GeckoTerminal · belum tersambung (simulasi)", tone: "warn" },
-    { name: "Profil token", meta: "DexScreener · belum tersambung (simulasi)", tone: "warn" },
-    { name: "Laporan risiko", meta: "RugCheck · belum tersambung (simulasi)", tone: "warn" },
-    { name: "Bubble map", meta: "Belum tersambung", tone: "warn" },
+  const sourceRows: { name: string; meta: string; tone: Tone }[] = [
+    ...(data?.sources ?? []).map(s => ({
+      name: s.name,
+      meta: s.ok ? `${s.count} data · ${(s.ms / 1000).toFixed(1)} dtk` : `Gagal: ${s.error ?? "tidak diketahui"}`,
+      tone: (s.ok ? "good" : "bad") as Tone,
+    })),
+    ...(data ? [{ name: "Kurs USD → IDR", meta: `${data.usdIdrLive ? "Live" : "Perkiraan"} · Rp${Math.round(data.usdIdr).toLocaleString("id-ID")}`, tone: (data.usdIdrLive ? "good" : "warn") as Tone }] : []),
     claudeStatus.isLoading
       ? { name: "Claude API", meta: "Memeriksa…", tone: "warn" }
       : claudeReady
-        ? { name: "Claude API", meta: `API key diatur · ${claudeStatus.data?.model}`, tone: "good" }
+        ? { name: "Claude API", meta: `Siap · otomatis ${claudeStatus.data?.autoModel}${claudeStatus.data?.webSearch ? " + riset web" : ""}`, tone: "good" }
         : { name: "Claude API", meta: claudeStatus.isError ? "Server tidak terjangkau" : "API key belum diatur di server", tone: "bad" },
   ];
-  const healthyCount = sources.filter(s => s.tone === "good").length;
+  const healthyCount = sourceRows.filter(s => s.tone === "good").length;
+  const selected = selectedMint ? candidates.find(c => c.mint === selectedMint) ?? null : null;
+  const allSourcesDown = data && data.sources.length > 0 && data.sources.every(s => !s.ok);
 
   return (
     <div className="solscreen-shell">
@@ -355,10 +451,10 @@ export default function Home() {
           </button>
         </nav>
         <div className="sidebar-bottom">
-          <div className="connection-card">
+          <div className="connection-card live">
             <div className="connection-head"><span className="eyebrow">STATUS RUNTIME</span><span className="live-dot" /></div>
-            <strong>Mode simulasi</strong>
-            <span>{claudeReady ? "Claude aktif · data Solana belum live" : "Data Solana & Claude belum tersambung"}</span>
+            <strong>Data live Solana</strong>
+            <span>{claudeReady ? "Claude aktif · review otomatis" : "Claude belum diatur"}</span>
           </div>
           <div className="profile-row"><div className="avatar">OP</div><div><strong>Operator</strong><span>Workspace pribadi</span></div><button type="button" className="icon-button small logout-button" title="Keluar" aria-label="Keluar" onClick={() => logout.mutate()} disabled={logout.isPending}><LogOut size={15} /></button></div>
         </div>
@@ -369,8 +465,8 @@ export default function Home() {
           <div className="mobile-brand"><AppMark /><span>solscreen</span></div>
           <div className="breadcrumb"><span>Workspace</span><ChevronRight size={14} /><strong>{NAV_LABEL[activeNav]}</strong></div>
           <div className="top-actions">
-            <button type="button" className="last-sync" onClick={refresh} title="Muat ulang data simulasi">
-              <RefreshCw size={12} /> Sinkron terakhir <strong>{formatClock(lastSync)}</strong>
+            <button type="button" className="last-sync" onClick={() => void refresh()} disabled={refreshing || screening.isFetching} title="Pindai ulang sekarang">
+              <RefreshCw size={12} className={refreshing || screening.isFetching ? "spin" : ""} /> Sinkron terakhir <strong>{lastSync ? formatClock(lastSync) : "—"}</strong>
             </button>
             <button type="button" className="icon-button" onClick={() => goTo("alerts")} aria-label={unreadAlerts > 0 ? `${unreadAlerts} alert belum dibaca` : "Alert"}>
               <Bell size={18} />{unreadAlerts > 0 && <span className="notification-badge" />}
@@ -382,9 +478,9 @@ export default function Home() {
         <div className="content-wrap">
           <section className="hero-row">
             <div>
-              <div className="eyebrow accent-eyebrow"><span className="tiny-square" /> INTELIJEN HARIAN / {today}</div>
+              <div className="eyebrow accent-eyebrow"><span className="tiny-square" /> INTELIJEN HARIAN / {dateFmt.format(lastSync ?? new Date()).toUpperCase()}</div>
               <h1>Sinyal sebelum <em>momentum.</em></h1>
-              <p className="hero-copy">Pantau token baru Solana dengan filter risiko yang mengutamakan bukti. Satu tempat untuk melihat kandidat, distribusi holder, dan pemicu alert.</p>
+              <p className="hero-copy">Token Solana yang muncul dalam 24 jam terakhir, harga di bawah Rp1, lalu disaring ketat: authority, wallet dev, distribusi holder, cluster insider, likuiditas, dan media sosial — kemudian ditinjau Claude.</p>
             </div>
             <div className="hero-note">
               <Sparkles size={16} /><span>Review AI · Claude</span>
@@ -402,21 +498,26 @@ export default function Home() {
             </section>
           )}
 
-          <section className="simulation-banner" aria-label="Pemberitahuan data simulasi">
+          <section className={`simulation-banner live-banner ${allSourcesDown || screening.isError ? "error" : ""}`} aria-label="Status data">
             <div className="scan-line" />
             <div className="banner-icon"><Radio size={18} /></div>
             <div className="banner-copy">
-              <strong>DATASET SIMULASI</strong>
-              <span>Harga, holder, dan alert di layar ini adalah contoh untuk pengembangan UI — belum ada koneksi live ke Solana atau provider on-chain. {claudeReady ? "Review AI memakai Claude sungguhan, tetapi menilai data simulasi ini." : ""}</span>
+              <strong>{screening.isError || allSourcesDown ? "SUMBER DATA BERMASALAH" : "DATA LIVE · SOLANA MAINNET"}</strong>
+              <span>
+                {screening.isError ? screening.error.message
+                  : allSourcesDown ? "Semua sumber data gagal dihubungi. Coba pindai ulang beberapa menit lagi."
+                  : data ? `Dipindai ${formatClock(new Date(data.generatedAt))}${data.cached ? " (cache ≤15 menit)" : ""} dari GeckoTerminal, DexScreener, dan RugCheck. Bukan saran investasi — token baru sangat berisiko.`
+                  : "Memindai token baru di Solana… pemindaian pertama bisa 10–30 detik."}
+              </span>
             </div>
-            <button type="button" className="banner-action" onClick={() => goTo("sources")}>Lihat peta integrasi <ChevronRight size={15} /></button>
+            <button type="button" className="banner-action" onClick={() => void refresh()} disabled={refreshing}>{refreshing ? "Memindai…" : "Pindai ulang"} <RefreshCw size={14} /></button>
           </section>
 
           <section className="metrics-grid" aria-label="Ringkasan screening">
-            <Metric label="Pool baru dipindai" value={String(screeningSummary.scanned)} detail={`${scannedDelta >= 0 ? "+" : ""}${scannedDelta} vs kemarin`} icon={<Activity size={16} />} tone="lime" />
-            <Metric label="Lolos filter awal" value={pad2(screeningSummary.passed)} detail={`${pct(screeningSummary.passed)}% dari yang dipindai`} icon={<ShieldCheck size={16} />} tone="blue" />
-            <Metric label="Perlu review manual" value={pad2(watchCount)} detail={`${unreadAlerts} alert belum dibaca`} icon={<CircleHelp size={16} />} tone="amber" />
-            <Metric label="Ditolak / risiko tinggi" value={String(rejectedCount)} detail={`${pct(rejectedCount)}% diblokir`} icon={<AlertTriangle size={16} />} tone="coral" />
+            <Metric label="Token baru dipindai" value={data ? String(data.scanned) : "…"} detail={data ? `${data.checked} dicek mendalam` : "memindai"} icon={<Activity size={16} />} tone="lime" />
+            <Metric label="Lolos semua syarat" value={data ? pad2(counts.lolos) : "…"} detail="dev, holder, insider, sosial sehat" icon={<ShieldCheck size={16} />} tone="blue" />
+            <Metric label="Perlu dipantau" value={data ? pad2(counts.pantau) : "…"} detail={`${unreadAlerts} alert belum dibaca`} icon={<CircleHelp size={16} />} tone="amber" />
+            <Metric label="Ditolak / risiko tinggi" value={data ? String(data.rejectedCount) : "…"} detail={data ? `harga ≥Rp1: ${data.prefilterRejected.harga} · umur >24j: ${data.prefilterRejected.umur}` : "—"} icon={<AlertTriangle size={16} />} tone="coral" />
           </section>
 
           <div className="section-heading candidate-heading" id="section-candidates">
@@ -424,8 +525,8 @@ export default function Home() {
             <div className="filter-bar">
               <label className="search-box"><Search size={15} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="Cari simbol atau mint" aria-label="Cari simbol atau mint" /></label>
               <label className="filter-select"><Filter size={14} />
-                <select value={riskFilter} onChange={event => setRiskFilter(event.target.value as "All" | Risk)} aria-label="Filter risiko">
-                  <option value="All">Semua</option><option value="Low">Rendah</option><option value="Medium">Sedang</option><option value="High">Tinggi</option>
+                <select value={statusFilter} onChange={event => setStatusFilter(event.target.value as "All" | Status)} aria-label="Filter status">
+                  <option value="All">Semua</option><option value="Lolos">Lolos</option><option value="Pantau">Pantau</option>
                 </select>
               </label>
             </div>
@@ -433,42 +534,46 @@ export default function Home() {
 
           <section className="candidate-layout">
             <div className="candidate-list">
-              {filtered.map(candidate => (
-                <CandidateCard key={candidate.symbol} candidate={candidate} hasReview={Boolean(reviews[candidate.symbol])} onOpen={() => setSelected(candidate)} onCopy={() => copyMint(candidate.mint)} />
+              {screening.isLoading && Array.from({ length: 3 }, (_, i) => <div key={i} className="candidate-card skeleton" aria-hidden="true" />)}
+              {filtered.map(c => (
+                <CandidateCard key={c.mint} candidate={c} review={reviews[c.mint]} reviewing={reviewing[c.mint] === true} onOpen={() => setSelectedMint(c.mint)} onCopy={() => void copyMint(c.mint)} />
               ))}
-              {filtered.length === 0 && (
-                <div className="empty-state"><Search size={22} /><strong>Tidak ada kandidat yang cocok</strong><span>Coba ubah kata kunci atau filter risiko.</span></div>
+              {data && filtered.length === 0 && (
+                <div className="empty-state">
+                  <Search size={22} />
+                  <strong>{candidates.length === 0 ? "Belum ada token yang lolos saringan saat ini" : "Tidak ada kandidat yang cocok"}</strong>
+                  <span>{candidates.length === 0
+                    ? `Dari ${data.scanned} token baru, ${data.rejectedCount} ditolak. Ini normal — sebagian besar token baru tidak sehat. Pindai ulang nanti.`
+                    : "Coba ubah kata kunci atau filter status."}</span>
+                </div>
+              )}
+              {data && data.rejected.length > 0 && (
+                <div className="rejected-box">
+                  <button type="button" className="text-button no-margin" aria-expanded={showRejected} onClick={() => setShowRejected(v => !v)}>
+                    {showRejected ? "Sembunyikan" : "Lihat"} {data.rejected.length} token yang dicek tapi ditolak <ChevronRight size={14} className={showRejected ? "rotate" : ""} />
+                  </button>
+                  {showRejected && (
+                    <ul>{data.rejected.map(r => <li key={r.mint}><SignalDot tone="bad" /><strong>{r.symbol}</strong><span>{r.reason}</span></li>)}</ul>
+                  )}
+                </div>
               )}
             </div>
             <aside className="right-rail">
-              <div className="rail-card confidence-card">
-                <div className="rail-card-head"><span className="eyebrow">KEYAKINAN SCREENING</span><Gauge size={16} /></div>
-                <div className="confidence-value">72<span>/100</span></div>
-                <div className="confidence-bar"><span style={{ width: "72%" }} /></div>
-                <p>Skor simulasi. Keyakinan turun karena data bubble map dan roadmap belum lengkap.</p>
-                <button type="button" className="text-button" aria-expanded={showScoring} onClick={() => setShowScoring(v => !v)}>
-                  Bagaimana skor dihitung? <ChevronRight size={14} className={showScoring ? "rotate" : ""} />
-                </button>
-                {showScoring && (
-                  <ul className="inline-explain">
-                    <li>Kelengkapan data: berapa banyak sumber yang memberi jawaban.</li>
-                    <li>Kesepakatan antar-sumber: apakah sumber saling menguatkan.</li>
-                    <li>Kesegaran: umur data sejak pemeriksaan terakhir.</li>
-                  </ul>
-                )}
-              </div>
+              <CreditCard usage={usage.data} loading={usage.isLoading} claudeReady={claudeReady} notify={notify} />
               <div className="rail-card source-card" id="section-sources">
-                <div className="rail-card-head"><span className="eyebrow">KESEHATAN SUMBER</span><span className={`healthy-pill ${healthyCount === 0 ? "warn" : ""}`}><span /> {healthyCount} / {sources.length} siap</span></div>
-                {sources.map(source => <SourceRow key={source.name} {...source} />)}
+                <div className="rail-card-head"><span className="eyebrow">KESEHATAN SUMBER</span><span className={`healthy-pill ${healthyCount < sourceRows.length ? "warn" : ""}`}><span /> {healthyCount} / {sourceRows.length} ok</span></div>
+                {sourceRows.map(source => <SourceRow key={source.name} {...source} />)}
               </div>
               <div className="rail-card rule-card">
-                <div className="rail-card-head"><span className="eyebrow">ATURAN AKTIF</span><Settings2 size={15} /></div>
-                <div className="rule-line"><span>Batas harga</span><strong>Rp1,00</strong></div>
-                <div className="rule-line"><span>Likuiditas min.</span><strong>$10K</strong></div>
-                <div className="rule-line"><span>Top 10 holder</span><strong>&lt; 55%</strong></div>
-                <div className="rule-line"><span>Ambang naik</span><strong>{settings.thresholds.length ? `+${settings.thresholds.join(" / +")}%` : "nonaktif"}</strong></div>
-                <div className="rule-line"><span>Ambang turun</span><strong>−{settings.downThreshold}%</strong></div>
-                <div className="rule-line"><span>Frekuensi cek</span><strong>{settings.frequencyMinutes} mnt</strong></div>
+                <div className="rail-card-head"><span className="eyebrow">ATURAN SCREENING</span><Settings2 size={15} /></div>
+                <div className="rule-line"><span>Umur token</span><strong>≤ {data?.rules.maxAgeHours ?? 24} jam</strong></div>
+                <div className="rule-line"><span>Harga</span><strong>&lt; Rp{data?.rules.maxPriceIdr ?? 1}</strong></div>
+                <div className="rule-line"><span>Likuiditas min.</span><strong>{formatUsdShort(data?.rules.minLiquidityUsd ?? 10000)}</strong></div>
+                <div className="rule-line"><span>Mint/freeze authority</span><strong>harus off</strong></div>
+                <div className="rule-line"><span>Top 10 holder</span><strong>≤ {data?.rules.top10HealthyPct ?? 30}%</strong></div>
+                <div className="rule-line"><span>Saldo wallet dev</span><strong>≤ {data?.rules.creatorHealthyPct ?? 3}%</strong></div>
+                <div className="rule-line"><span>Cluster insider</span><strong>0</strong></div>
+                <div className="rule-line"><span>Ambang alert</span><strong>{settings.thresholds.length ? `+${settings.thresholds.join("/+")}%` : "off"} · −{settings.downThreshold}%</strong></div>
                 <button type="button" className="outline-button" onClick={() => setSettingsOpen(true)}>Ubah ambang alert <Settings2 size={14} /></button>
               </div>
             </aside>
@@ -477,47 +582,37 @@ export default function Home() {
           <section className="lower-grid">
             <div className="panel alerts-panel" id="section-alerts">
               <div className="panel-heading">
-                <div><div className="eyebrow">ALIRAN EVENT</div><h2>Alert terbaru</h2></div>
-                {unreadAlerts > 0 && <button type="button" className="text-button no-margin" onClick={() => setUnreadAlerts(0)}>Tandai dibaca</button>}
+                <div><div className="eyebrow">PERGERAKAN 1 JAM</div><h2>Alert terbaru</h2></div>
+                {unreadAlerts > 0 && <button type="button" className="text-button no-margin" onClick={() => setReadAlerts(new Set(alerts.map(a => a.key)))}>Tandai dibaca</button>}
               </div>
               <div className="alert-list">
+                {alerts.length === 0 && <p className="integration-copy">Belum ada kandidat yang bergerak melewati ambang alert Anda dalam 1 jam terakhir.</p>}
                 {alerts.map(alert => (
-                  <div className="alert-row" key={`${alert.token}-${alert.minutesAgo}`}>
+                  <button type="button" className="alert-row as-button" key={alert.key} onClick={() => setSelectedMint(alert.mint)}>
                     <div className={`alert-icon ${alert.kind}`}>{alert.kind === "up" ? <ArrowUpRight size={16} /> : <ArrowDownRight size={16} />}</div>
                     <div className="alert-main">
-                      <strong>{alert.token} <span>{alert.trigger}</span></strong>
-                      <small>Event simulasi · {formatClock(new Date(lastSync.getTime() - alert.minutesAgo * 60_000))}</small>
+                      <strong>{alert.symbol} <span>{alert.trigger}</span></strong>
+                      <small>{readAlerts.has(alert.key) ? "Sudah dibaca" : "Baru"} · data {lastSync ? formatClock(lastSync) : "—"}</small>
                     </div>
-                    <div className={`alert-move ${alert.kind}`}>{alert.move}</div>
+                    <div className={`alert-move ${alert.kind}`}>{fmtChange(alert.move)}</div>
                     <span className="alert-notify" title={settings.push ? "Notifikasi push aktif" : "Notifikasi push nonaktif"}>{settings.push ? <Bell size={14} /> : <BellOff size={14} />}</span>
-                  </div>
+                  </button>
                 ))}
               </div>
             </div>
             <div className="panel integration-panel">
-              <div className="panel-heading"><div><div className="eyebrow">PETA INTEGRASI</div><h2>Status koneksi</h2></div><Code2 size={18} className="panel-icon" /></div>
+              <div className="panel-heading"><div><div className="eyebrow">CARA KERJA</div><h2>Alur screening</h2></div><Zap size={18} className="panel-icon" /></div>
               <div className="integration-flow">
-                <FlowNode label="Data Solana" status="Simulasi" tone="warn" />
+                <FlowNode label="Token baru" status={data ? `${data.scanned} token` : "…"} tone="good" />
                 <div className="flow-line" />
-                <FlowNode label="Aturan risiko" status="Aktif" tone="good" />
+                <FlowNode label="Aturan risiko" status={data ? `${data.checked} dicek` : "…"} tone="good" />
                 <div className="flow-line" />
-                <FlowNode label="Claude API" status={claudeReady ? "Siap" : "Belum diatur"} tone={claudeReady ? "good" : "blue"} />
+                <FlowNode label="Claude" status={claudeReady ? `${Object.keys(reviews).length} direview` : "Belum diatur"} tone={claudeReady ? "good" : "blue"} />
               </div>
-              <p className="integration-copy">Kandidat yang lolos filter dikirim ke Claude lewat server. Claude mengembalikan JSON terstruktur berisi verdict, skor risiko, red flag, dan langkah verifikasi. API key tidak pernah dikirim ke browser.</p>
-              <button type="button" className="outline-button full" aria-expanded={showChecklist} onClick={() => setShowChecklist(v => !v)}>
-                {showChecklist ? "Sembunyikan checklist" : "Lihat checklist integrasi"} <ChevronRight size={14} className={showChecklist ? "rotate" : ""} />
-              </button>
-              {showChecklist && (
-                <ul className="checklist">
-                  <li className={claudeReady ? "done" : ""}>{claudeReady ? <Check size={13} /> : <span className="dot" />} ANTHROPIC_API_KEY diatur di server</li>
-                  <li><span className="dot" /> Sambungkan provider data Solana (GeckoTerminal / DexScreener / RugCheck)</li>
-                  <li><span className="dot" /> Simpan hasil screening & review ke database</li>
-                  <li><span className="dot" /> Kirim notifikasi push / Telegram dari server</li>
-                </ul>
-              )}
+              <p className="integration-copy">Setiap pemindaian mengambil token Solana terbaru, membuang yang berumur &gt;24 jam, berharga ≥Rp1, atau likuiditasnya tipis, lalu memeriksa authority, wallet dev, distribusi holder, jaringan insider (pengganti bubble map), dan LP lewat RugCheck. Kandidat yang tersisa ditinjau Claude, termasuk riset media sosial dan rencana proyek di web. Hasil review disimpan 24 jam agar kredit tidak terbuang.</p>
             </div>
           </section>
-          <footer className="footer-note"><span><Zap size={13} /> Dibuat untuk pemantauan berbasis bukti</span><span>Harga dan status hanya valid pada waktu pemeriksaan. Bukan saran investasi.</span></footer>
+          <footer className="footer-note"><span><Zap size={13} /> Dibuat untuk pemantauan berbasis bukti</span><span>Harga dan status hanya valid pada waktu pemindaian. Bukan saran investasi.</span></footer>
         </div>
       </main>
 
@@ -544,16 +639,62 @@ export default function Home() {
           candidate={selected}
           claudeReady={claudeReady}
           claudeModel={claudeStatus.data?.model}
-          review={reviews[selected.symbol]}
-          onReview={result => setReviews(prev => ({ ...prev, [selected.symbol]: result }))}
-          onClose={() => setSelected(null)}
-          onCopy={() => copyMint(selected.mint)}
+          review={reviews[selected.mint]}
+          reviewing={reviewing[selected.mint] === true}
+          reviewError={reviewErrors[selected.mint]}
+          onReview={mode => void runReview(selected.mint, mode)}
+          onClose={() => setSelectedMint(null)}
+          onCopy={() => void copyMint(selected.mint)}
         />
       )}
 
       <div className="toast-region" role="status" aria-live="polite">
         {toast && <div className="toast"><Check size={15} /> {toast}</div>}
       </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Claude credit meter
+// ---------------------------------------------------------------------------
+function CreditCard({ usage, loading, claudeReady, notify }: { usage?: Usage; loading: boolean; claudeReady: boolean; notify: (m: string) => void }) {
+  const utils = trpc.useUtils();
+  const [editing, setEditing] = useState(false);
+  const [amount, setAmount] = useState("");
+  const setBalance = trpc.ai.setBalance.useMutation({
+    onSuccess: data => { utils.ai.usage.setData(undefined, data); setEditing(false); setAmount(""); notify("Saldo kredit disimpan"); },
+  });
+  const remaining = usage?.remainingUsd ?? null;
+  const pct = usage?.balance && usage.balance.amountUsd > 0 && remaining !== null ? Math.max(0, Math.min(100, (remaining / usage.balance.amountUsd) * 100)) : null;
+  const totalTokens = (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0);
+
+  return (
+    <div className="rail-card credit-card">
+      <div className="rail-card-head"><span className="eyebrow">KREDIT CLAUDE</span><Coins size={16} /></div>
+      {loading ? <p>Memuat…</p> : (
+        <>
+          <div className="confidence-value">{remaining !== null ? formatUsdMoney(remaining) : formatUsdMoney(usage?.costUsd ?? 0)}<span>{remaining !== null ? " sisa (perkiraan)" : " terpakai"}</span></div>
+          {pct !== null && <div className="confidence-bar"><span style={{ width: `${pct}%` }} /></div>}
+          <div className="credit-lines">
+            <div><span>Terpakai</span><strong>{formatUsdMoney(usage?.spentSinceBalanceUsd ?? usage?.costUsd ?? 0)}</strong></div>
+            <div><span>Token</span><strong>{totalTokens.toLocaleString("id-ID")}</strong></div>
+            <div><span>Panggilan · riset web</span><strong>{usage?.calls ?? 0} · {usage?.webSearches ?? 0}</strong></div>
+          </div>
+          {!usage?.persistent && <p className="credit-warn"><AlertTriangle size={12} /> Penghitung tersimpan di memori server dan bisa ter-reset. Hubungkan Upstash Redis agar akurat.</p>}
+          {!claudeReady && <p className="credit-warn"><AlertTriangle size={12} /> Claude belum diatur — belum ada pemakaian.</p>}
+          {editing ? (
+            <form className="credit-form" onSubmit={e => { e.preventDefault(); const v = Number(amount.replace(",", ".")); if (Number.isFinite(v) && v >= 0) setBalance.mutate({ amountUsd: v }); }}>
+              <span>US$</span>
+              <input autoFocus inputMode="decimal" value={amount} onChange={e => setAmount(e.target.value)} placeholder="mis. 5,00" aria-label="Saldo kredit saat ini (USD)" />
+              <button type="submit" className="add-chip" aria-label="Simpan saldo" disabled={setBalance.isPending}><Check size={14} /></button>
+            </form>
+          ) : (
+            <button type="button" className="text-button" onClick={() => setEditing(true)}>{usage?.balance ? "Perbarui saldo dari Console" : "Isi saldo dari Console"} <ChevronRight size={14} /></button>
+          )}
+          <p className="credit-note">Anthropic tidak menyediakan API saldo, jadi ini dihitung dari pemakaian aplikasi × harga resmi. Cocokkan sesekali dengan platform.claude.com.</p>
+        </>
+      )}
     </div>
   );
 }
@@ -668,6 +809,7 @@ function SettingsDrawer({ initial, onClose, onSave, notify, focusSecurity, minPa
         <div className="setting-group">
           <div className="setting-label">Notifikasi</div>
           <div className="toggle-row"><span><Bell size={16} /> Notifikasi push browser</span><Switch label="Notifikasi push browser" checked={draft.push} onChange={next => void togglePush(next)} disabled={!notificationsSupported} /></div>
+          <div className="toggle-row"><span><Sparkles size={16} /> Review Claude otomatis</span><Switch label="Review Claude otomatis" checked={draft.autoReview} onChange={next => setDraft(d => ({ ...d, autoReview: next }))} /></div>
           <div className="toggle-row muted"><span><MessageCircle size={16} /> Telegram (segera hadir)</span><Switch label="Telegram, segera hadir" checked={false} onChange={() => undefined} disabled /></div>
         </div>
 
@@ -766,78 +908,80 @@ function SecuritySection({ focus, minLength, persistent, notify, onLogout }: { f
   );
 }
 
+
 // ---------------------------------------------------------------------------
 // Detail modal with Claude review
 // ---------------------------------------------------------------------------
-const VERDICT: Record<ReviewResult["verdict"], { label: string; tone: Tone }> = {
+const VERDICT: Record<Review["verdict"], { label: string; tone: Tone }> = {
   layak_dipantau: { label: "Layak dipantau", tone: "good" },
   perlu_review_manual: { label: "Perlu review manual", tone: "warn" },
   hindari: { label: "Hindari", tone: "bad" },
 };
 
-function DetailModal({ candidate, claudeReady, claudeModel, review, onReview, onClose, onCopy }: {
+const CHECK_LABELS: [keyof Candidate["checks"], string][] = [
+  ["authorities", "Authority"],
+  ["devWallet", "Wallet dev"],
+  ["holders", "Distribusi holder"],
+  ["bubble", "Bubble map / insider"],
+  ["liquidity", "Likuiditas & LP"],
+  ["socials", "Media sosial"],
+];
+
+function linkIcon(label: string) {
+  return /twitter|x\.com/i.test(label) ? "X" : /telegram/i.test(label) ? "TG" : /discord/i.test(label) ? "DC" : "WEB";
+}
+
+function DetailModal({ candidate, claudeReady, claudeModel, review, reviewing, reviewError, onReview, onClose, onCopy }: {
   candidate: Candidate;
   claudeReady: boolean;
   claudeModel?: string;
-  review?: ReviewResult;
-  onReview: (result: ReviewResult) => void;
+  review?: Review;
+  reviewing: boolean;
+  reviewError?: string;
+  onReview: (mode: "auto" | "deep") => void;
   onClose: () => void;
   onCopy: () => void;
 }) {
   const ref = useDialog(true, onClose);
-  const mutation = trpc.ai.reviewToken.useMutation({ onSuccess: data => onReview(data) });
-
-  const requestReview = () =>
-    mutation.mutate({
-      name: candidate.name,
-      symbol: candidate.symbol,
-      mint: candidate.mint,
-      isSimulated: true,
-      status: candidate.status,
-      risk: candidate.risk,
-      priceIdr: candidate.price,
-      priceUsd: candidate.priceUsd,
-      change24hPct: candidate.change,
-      liquidityUsd: candidate.liquidity,
-      volume24hUsd: candidate.volume,
-      detected: formatAgo(candidate.detectedMinutesAgo),
-      holders: candidate.holders,
-      devWallet: candidate.dev,
-      bubbleMap: candidate.bubble,
-      socials: candidate.socials,
-      roadmap: candidate.roadmap,
-      ruleSignals: candidate.reasons.map(r => r.text),
-    });
+  const accent = accentFor(candidate.mint);
+  const links = [...candidate.websites, ...candidate.socials];
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <section ref={ref as RefObject<HTMLElement>} className="detail-modal" role="dialog" aria-modal="true" aria-labelledby="detail-title" onClick={event => event.stopPropagation()}>
         <div className="modal-top">
           <div className="token-identity">
-            <div className="token-orb large" style={{ background: `linear-gradient(135deg, ${candidate.accent}, #18243e)` }}>{candidate.symbol.slice(0, 1)}</div>
+            <TokenOrb candidate={candidate} large />
             <div>
-              <div className="eyebrow">REVIEW TOKEN / SIMULASI</div>
+              <div className="eyebrow">REVIEW TOKEN / LIVE · {formatAgo(candidate.ageMinutes).toUpperCase()}</div>
               <h2 id="detail-title">{candidate.name} <span>{candidate.symbol}</span></h2>
-              <div className="mint-row"><code>{candidate.mint}</code><button type="button" className="mini-copy" onClick={onCopy} aria-label="Salin alamat mint"><Copy size={13} /></button></div>
+              <div className="mint-row"><code>{shortMint(candidate.mint)}</code><button type="button" className="mini-copy" onClick={onCopy} aria-label="Salin alamat mint"><Copy size={13} /></button></div>
             </div>
           </div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Tutup"><X size={18} /></button>
         </div>
         <div className="detail-status-row">
-          <RiskBadge risk={candidate.risk} />
+          <span className={`risk-badge ${candidate.risk.toLowerCase()}`}><span /> {RISK_LABEL[candidate.risk]}</span>
           <StatusBadge status={candidate.status} />
-          <span className="detail-price">{candidate.price} <small>{candidate.priceUsd}</small></span>
-          <span className={`detail-change ${candidate.change >= 0 ? "positive" : "negative"}`}>{candidate.change >= 0 ? "+" : ""}{candidate.change}%</span>
+          <span className="detail-price">{formatIdr(candidate.priceIdr)} <small>{formatUsdPrice(candidate.priceUsd)}</small></span>
+          <span className={`detail-change ${(candidate.change.h24 ?? 0) >= 0 ? "positive" : "negative"}`}>{fmtChange(candidate.change.h24)}</span>
         </div>
         <div className="detail-grid">
-          <div className="detail-stat"><span>Likuiditas</span><strong>{candidate.liquidity}</strong><small>Kedalaman pool (simulasi)</small></div>
-          <div className="detail-stat"><span>Volume 24j</span><strong>{candidate.volume}</strong><small>Belum dicek silang</small></div>
-          <div className="detail-stat"><span>Distribusi holder</span><strong>{candidate.holders}</strong><small>Snapshot saat deteksi</small></div>
-          <div className="detail-stat"><span>Wallet dev</span><strong>{candidate.dev}</strong><small>Authority ≠ kesehatan wallet</small></div>
+          <div className="detail-stat"><span>Likuiditas</span><strong>{formatUsdShort(candidate.liquidityUsd)}</strong><small>{candidate.checks.liquidity.lpLockedPct !== null ? `LP ${Math.round(candidate.checks.liquidity.lpLockedPct)}% terkunci` : "LP tidak diketahui"}</small></div>
+          <div className="detail-stat"><span>Volume 24j</span><strong>{formatUsdShort(candidate.volume24hUsd)}</strong><small>Market cap {formatUsdShort(candidate.marketCapUsd)}</small></div>
+          <div className="detail-stat"><span>Holder</span><strong>{candidate.checks.holders.totalHolders?.toLocaleString("id-ID") ?? "—"}</strong><small>{candidate.checks.holders.label}</small></div>
+          <div className="detail-stat"><span>RugCheck</span><strong>{candidate.rugScore ?? "—"}/100</strong><small>Makin rendah makin aman</small></div>
         </div>
+
+        <div className="check-grid">
+          {CHECK_LABELS.map(([key, label]) => (
+            <div key={key} className={`check-item ${candidate.checks[key].tone}`}><SignalDot tone={candidate.checks[key].tone} /><div><span>{label}</span><strong>{candidate.checks[key].label}</strong></div></div>
+          ))}
+        </div>
+
         <div className="detail-columns">
           <div>
-            <div className="eyebrow">SINYAL ATURAN</div>
+            <div className="eyebrow">TEMUAN ATURAN</div>
             <div className="signal-list">
               {candidate.reasons.map(reason => (
                 <div className="signal-list-row" key={reason.text}><SignalDot tone={reason.tone} /><span>{reason.text}</span></div>
@@ -845,48 +989,68 @@ function DetailModal({ candidate, claudeReady, claudeModel, review, onReview, on
             </div>
           </div>
           <div className="detail-spark">
-            <div className="eyebrow">JALUR HARGA / SIMULASI</div>
-            <div className="large-spark"><Sparkline data={candidate.spark} color={candidate.accent} /></div>
-            <div className="spark-caption"><span>Terdeteksi {formatAgo(candidate.detectedMinutesAgo)}</span><strong>Sekarang</strong></div>
+            <div className="eyebrow">HARGA · 24J → SEKARANG</div>
+            <div className="large-spark"><Sparkline data={candidate.spark} color={accent} /></div>
+            <div className="spark-caption"><span>1j {fmtChange(candidate.change.h1)}</span><strong>24j {fmtChange(candidate.change.h24)}</strong></div>
           </div>
         </div>
+
+        {(candidate.description || links.length > 0) && (
+          <div className="project-box">
+            <div className="eyebrow">PROYEK & MEDIA SOSIAL</div>
+            {candidate.description && <p>{candidate.description}</p>}
+            <div className="link-chips">
+              {links.map(l => <a key={l.url} href={l.url} target="_blank" rel="noopener noreferrer nofollow" className="link-chip"><span>{linkIcon(`${l.label} ${l.url}`)}</span>{l.label}<ExternalLink size={11} /></a>)}
+            </div>
+          </div>
+        )}
 
         <div className="ai-review" aria-live="polite">
           <div className="ai-review-head">
             <div className="eyebrow"><Sparkles size={12} /> REVIEW AI / CLAUDE</div>
-            {review && <span className="ai-meta">{review.model} · {formatClock(new Date(review.reviewedAt))}</span>}
+            {review && <span className="ai-meta">{review.mode === "deep" ? "Mendalam" : "Otomatis"} · {review.model}{review.webSearches ? ` · ${review.webSearches} pencarian web` : ""} · {formatClock(new Date(review.reviewedAt))}</span>}
           </div>
-          {mutation.isPending && <div className="ai-placeholder"><Loader2 size={15} className="spin" /> Claude sedang meninjau data token…</div>}
-          {!mutation.isPending && mutation.error && <div className="ai-error"><AlertTriangle size={14} /> {mutation.error.message}</div>}
-          {!mutation.isPending && !review && !mutation.error && (
+          {reviewing && <div className="ai-placeholder"><Loader2 size={15} className="spin" /> Claude sedang meninjau data on-chain dan mencari media sosial serta rencana proyek…</div>}
+          {!reviewing && reviewError && <div className="ai-error"><AlertTriangle size={14} /> {reviewError}</div>}
+          {!reviewing && !review && !reviewError && (
             <div className="ai-placeholder">
               {claudeReady
-                ? `Minta Claude (${claudeModel}) menilai sinyal token ini. Hasilnya berupa penilaian risiko, bukan saran membeli atau menjual.`
+                ? "Belum ada review. Review otomatis berjalan untuk kandidat teratas; klik tombol di bawah untuk meninjau token ini."
                 : "Claude API belum dikonfigurasi. Isi ANTHROPIC_API_KEY di server untuk mengaktifkan review AI."}
             </div>
           )}
-          {!mutation.isPending && review && <ReviewView review={review} />}
+          {!reviewing && review && <ReviewView review={review} />}
         </div>
 
         <div className="modal-footer">
           <div className="external-links">
-            <span><Globe2 size={14} /> {candidate.socials}</span>
-            <span><PanelRight size={14} /> {candidate.roadmap}</span>
+            <a href={candidate.links.dexscreener} target="_blank" rel="noopener noreferrer"><Globe2 size={14} /> DexScreener</a>
+            <a href={candidate.links.rugcheck} target="_blank" rel="noopener noreferrer"><ShieldCheck size={14} /> RugCheck</a>
+            <a href={candidate.links.solscan} target="_blank" rel="noopener noreferrer"><Database size={14} /> Solscan</a>
           </div>
-          <button type="button" className="primary-button" onClick={requestReview} disabled={!claudeReady || mutation.isPending}>
-            {mutation.isPending ? <Loader2 size={15} className="spin" /> : <Sparkles size={15} />} {review ? "Review ulang" : "Minta review AI"}
-          </button>
+          <div className="modal-actions">
+            {!review && (
+              <button type="button" className="outline-button no-margin" onClick={() => onReview("auto")} disabled={!claudeReady || reviewing}>
+                <Sparkles size={14} /> Review cepat
+              </button>
+            )}
+            <button type="button" className="primary-button" onClick={() => onReview("deep")} disabled={!claudeReady || reviewing} title={`Model ${claudeModel ?? ""} + riset web lebih luas`}>
+              {reviewing ? <Loader2 size={15} className="spin" /> : <Sparkles size={15} />} Review mendalam
+            </button>
+          </div>
         </div>
       </section>
     </div>
   );
 }
 
-function ReviewView({ review }: { review: ReviewResult }) {
+function ReviewView({ review }: { review: Review }) {
   const verdict = VERDICT[review.verdict];
   const lists: { title: string; items: string[]; tone: Tone }[] = [
     { title: "Red flag", items: review.redFlags, tone: "bad" },
     { title: "Sinyal positif", items: review.positiveSignals, tone: "good" },
+    { title: "Media sosial", items: review.socialFindings, tone: "warn" },
+    { title: "Rencana proyek", items: review.projectPlans, tone: "warn" },
     { title: "Data yang kurang", items: review.missingData, tone: "warn" },
     { title: "Cek berikutnya", items: review.nextChecks, tone: "warn" },
   ];
@@ -896,6 +1060,7 @@ function ReviewView({ review }: { review: ReviewResult }) {
         <span className={`verdict-badge ${verdict.tone}`}><SignalDot tone={verdict.tone} /> {verdict.label}</span>
         <span className="ai-score">Skor risiko <strong>{review.riskScore}</strong>/100</span>
         <span className="ai-score">Keyakinan <strong>{review.confidence}</strong>/100</span>
+        <span className="ai-score">Biaya <strong>{formatUsdMoney(review.costUsd)}</strong></span>
       </div>
       <p className="ai-summary">{review.summary}</p>
       <div className="ai-lists">
@@ -920,41 +1085,58 @@ function Metric({ label, value, detail, icon, tone }: { label: string; value: st
   );
 }
 
-function CandidateCard({ candidate, hasReview, onOpen, onCopy }: { candidate: Candidate; hasReview: boolean; onOpen: () => void; onCopy: () => void }) {
+function TokenOrb({ candidate, large }: { candidate: Candidate; large?: boolean }) {
+  const [broken, setBroken] = useState(false);
+  const accent = accentFor(candidate.mint);
+  return (
+    <div className={`token-orb ${large ? "large" : ""}`} style={{ background: `linear-gradient(135deg, ${accent}, #18243e)` }}>
+      {candidate.imageUrl && !broken
+        ? <img src={candidate.imageUrl} alt="" loading="lazy" referrerPolicy="no-referrer" onError={() => setBroken(true)} />
+        : candidate.symbol.slice(0, 1)}
+    </div>
+  );
+}
+
+function CandidateCard({ candidate, review, reviewing, onOpen, onCopy }: { candidate: Candidate; review?: Review; reviewing: boolean; onOpen: () => void; onCopy: () => void }) {
+  const h24 = candidate.change.h24 ?? 0;
+  const links = [...candidate.websites, ...candidate.socials].slice(0, 4);
   return (
     <article className="candidate-card">
       <div className="candidate-top">
         <div className="token-identity">
-          <div className="token-orb" style={{ background: `linear-gradient(135deg, ${candidate.accent}, #18243e)` }}>{candidate.symbol.slice(0, 1)}</div>
+          <TokenOrb candidate={candidate} />
           <div>
             <div className="token-name-row"><h3>{candidate.name}</h3><span className="symbol-label">{candidate.symbol}</span></div>
-            <div className="mint-row"><code>{candidate.mint}</code><button type="button" className="mini-copy" onClick={onCopy} aria-label={`Salin mint ${candidate.symbol}`}><Copy size={12} /></button></div>
+            <div className="mint-row"><code>{shortMint(candidate.mint)}</code><button type="button" className="mini-copy" onClick={onCopy} aria-label={`Salin mint ${candidate.symbol}`}><Copy size={12} /></button></div>
           </div>
         </div>
         <div className="card-actions">
-          {hasReview && <span className="ai-done" title="Sudah direview Claude"><Sparkles size={12} /></span>}
+          {reviewing && <span className="ai-done" title="Claude sedang meninjau"><Loader2 size={12} className="spin" /></span>}
+          {review && <span className={`verdict-badge small ${VERDICT[review.verdict].tone}`} title={`Review Claude: ${VERDICT[review.verdict].label}`}><Sparkles size={11} /> {VERDICT[review.verdict].label}</span>}
           <StatusBadge status={candidate.status} />
           <button type="button" className="icon-button small" onClick={onOpen} aria-label={`Buka detail ${candidate.symbol}`}><ChevronRight size={16} /></button>
         </div>
       </div>
       <div className="candidate-main">
-        <div className="price-block"><span className="eyebrow">HARGA / IDR</span><strong>{candidate.price}</strong><span className="usd-price">{candidate.priceUsd}</span></div>
-        <div className={`change-pill ${candidate.change >= 0 ? "positive" : "negative"}`}>
-          {candidate.change >= 0 ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}{Math.abs(candidate.change)}%
+        <div className="price-block"><span className="eyebrow">HARGA / IDR</span><strong>{formatIdr(candidate.priceIdr)}</strong><span className="usd-price">{formatUsdPrice(candidate.priceUsd)}</span></div>
+        <div className={`change-pill ${h24 >= 0 ? "positive" : "negative"}`}>
+          {h24 >= 0 ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}{fmtChange(candidate.change.h24).replace(/^[+-]/, "")}
         </div>
-        <div className="mini-chart"><Sparkline data={candidate.spark} color={candidate.accent} /></div>
-        <div className="detected"><Clock3 size={13} /> {formatAgo(candidate.detectedMinutesAgo)}</div>
+        <div className="mini-chart"><Sparkline data={candidate.spark} color={accentFor(candidate.mint)} /></div>
+        <div className="detected"><Clock3 size={13} /> {formatAgo(candidate.ageMinutes)}</div>
       </div>
       <div className="candidate-signals">
-        <SignalItem label="Wallet dev" value={candidate.dev} tone={candidate.devTone} />
-        <SignalItem label="Sebaran holder" value={candidate.holders} tone={candidate.holderTone} />
-        <SignalItem label="Bubble map" value={candidate.bubble} tone={candidate.bubbleTone} />
-        <SignalItem label="Bukti proyek" value={candidate.roadmap} tone={candidate.roadmapTone} />
+        <SignalItem label="Wallet dev" value={candidate.checks.devWallet.label} tone={candidate.checks.devWallet.tone} />
+        <SignalItem label="Sebaran holder" value={candidate.checks.holders.label} tone={candidate.checks.holders.tone} />
+        <SignalItem label="Bubble map" value={candidate.checks.bubble.label} tone={candidate.checks.bubble.tone} />
+        <SignalItem label="Media sosial" value={candidate.checks.socials.label} tone={candidate.checks.socials.tone} />
       </div>
       <div className="candidate-bottom">
-        <div className="metric-inline"><span>Likuiditas</span><strong>{candidate.liquidity}</strong></div>
-        <div className="metric-inline"><span>Volume 24j</span><strong>{candidate.volume}</strong></div>
-        <div className="tag-list">{candidate.tags.map(tag => <span key={tag}>{tag}</span>)}</div>
+        <div className="metric-inline"><span>Likuiditas</span><strong>{formatUsdShort(candidate.liquidityUsd)}</strong></div>
+        <div className="metric-inline"><span>Volume 24j</span><strong>{formatUsdShort(candidate.volume24hUsd)}</strong></div>
+        <div className="tag-list">
+          {links.map(l => <a key={l.url} href={l.url} target="_blank" rel="noopener noreferrer nofollow" title={l.url}>{linkIcon(`${l.label} ${l.url}`)}</a>)}
+        </div>
         <button type="button" className="review-button" onClick={onOpen}>Tinjau kandidat <ChevronRight size={14} /></button>
       </div>
     </article>
@@ -965,12 +1147,8 @@ function SignalItem({ label, value, tone }: { label: string; value: string; tone
   return <div className="signal-item"><span>{label}</span><div><SignalDot tone={tone} /><strong title={value}>{value}</strong></div></div>;
 }
 
-function RiskBadge({ risk }: { risk: Risk }) {
-  return <span className={`risk-badge ${risk.toLowerCase()}`}><span /> {RISK_LABEL[risk]}</span>;
-}
-
-function StatusBadge({ status }: { status: CandidateStatus }) {
-  return <span className={`status-badge ${status.toLowerCase()}`}>{STATUS_LABEL[status]}</span>;
+function StatusBadge({ status }: { status: Status }) {
+  return <span className={`status-badge ${STATUS_CLASS[status]}`}>{status}</span>;
 }
 
 function SourceRow({ name, meta, tone }: { name: string; meta: string; tone: Tone }) {

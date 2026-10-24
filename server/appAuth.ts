@@ -46,8 +46,10 @@ const withEnvSecret = (value: StoredAuth): StoredAuth => ({ ...value, secret: pr
 export type PasswordMode = "env" | "app";
 
 export function passwordMode(env: NodeJS.ProcessEnv = process.env): PasswordMode {
-  if (env.APP_PASSWORD) return "env";
+  // With Redis the password lives there and can be changed in the app;
+  // APP_PASSWORD then only seeds the first password.
   if (redisEnv(env)) return "app";
+  if (env.APP_PASSWORD) return "env";
   if (env.VERCEL) return "env"; // no persistent storage on Vercel without Redis
   return "app";
 }
@@ -90,7 +92,8 @@ async function load(): Promise<StoredAuth> {
     }
     let persisted = true;
     if (!value || !value.salt || !value.hash || !value.secret) {
-      value = freshState(process.env.APP_DEFAULT_PASSWORD || DEFAULT_PASSWORD_FALLBACK, true);
+      const seed = process.env.APP_PASSWORD || process.env.APP_DEFAULT_PASSWORD;
+      value = freshState(seed || DEFAULT_PASSWORD_FALLBACK, !seed);
       persisted = await store.write(value).catch(() => false);
     }
     cached = { value: withEnvSecret(value), at: Date.now(), persisted };

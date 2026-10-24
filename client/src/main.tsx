@@ -86,3 +86,10 @@ createRoot(document.getElementById("root")!).render(
     </QueryClientProvider>
   </trpc.Provider>
 );
+
+// PWA: register the service worker (production only, so dev HMR isn't cached).
+if ("serviceWorker" in navigator && import.meta.env.PROD) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch(error => console.warn("[PWA] service worker gagal", error));
+  });
+}

@@ -195,4 +195,25 @@ describe("app password", () => {
     expect(redisEnv({ UPSTASH_REDIS_REST_URL: "https://b.upstash.io", UPSTASH_REDIS_REST_TOKEN: "u" })).toEqual({ url: "https://b.upstash.io", token: "u" });
     expect(redisEnv({ KV_REST_API_URL: "https://c.upstash.io" })).toBeNull();
   });
+
+  it("with Redis connected: APP_PASSWORD only seeds the first password, which can then be changed in the app", async () => {
+    let saved: StoredAuth | null = null;
+    setAuthStoreForTests({
+      kind: "redis",
+      read: async () => saved,
+      write: async v => { saved = v; return true; },
+      addFailure: async () => 1, failures: async () => 0, clearFailures: async () => undefined,
+    });
+    vi.stubEnv("KV_REST_API_URL", "https://example.upstash.io");
+    vi.stubEnv("KV_REST_API_TOKEN", "t");
+    vi.stubEnv("APP_PASSWORD", "rahasia123");
+    resetAppAuthForTests();
+    expect(await verifyPassword("rahasia123")).toBe(true);
+    expect(await isUsingDefaultPassword()).toBe(false);
+    expect(await changePassword("rahasia123", "gantiDariWeb1")).toEqual({ ok: true, persisted: true });
+    resetAppAuthForTests();
+    expect(await verifyPassword("gantiDariWeb1")).toBe(true);
+    const session = await appRouter.createCaller((await fakeCtx()).ctx).appAuth.session();
+    expect(session.passwordManagedBy).toBe("app");
+  });
 });

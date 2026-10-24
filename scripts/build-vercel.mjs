@@ -29,7 +29,7 @@ await build({
 });
 writeFileSync(
   path.join(fnDir, ".vc-config.json"),
-  JSON.stringify({ runtime: "nodejs22.x", handler: "index.cjs", launcherType: "Nodejs", shouldAddHelpers: false, maxDuration: 60 }, null, 2),
+  JSON.stringify({ runtime: "nodejs22.x", handler: "index.cjs", launcherType: "Nodejs", shouldAddHelpers: false, maxDuration: 120 }, null, 2),
 );
 
 // 3. Routing: static files first, then /api/* -> function, everything else -> SPA.
@@ -40,6 +40,8 @@ writeFileSync(
       version: 3,
       routes: [
         { src: "/assets/(.*)", headers: { "cache-control": "public, max-age=31536000, immutable" }, continue: true },
+        { src: "/sw\\.js", headers: { "cache-control": "no-cache", "service-worker-allowed": "/" }, continue: true },
+        { src: "/manifest\\.webmanifest", headers: { "content-type": "application/manifest+json", "cache-control": "no-cache" }, continue: true },
         { handle: "filesystem" },
         { src: "/api/(.*)", dest: "/api" },
         { src: "/(.*)", dest: "/index.html" },

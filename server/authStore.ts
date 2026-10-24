@@ -31,10 +31,25 @@ export interface AuthStore {
 const AUTH_KEY = "solscreen:app-auth";
 const failKey = (key: string) => `solscreen:login-fail:${key}`;
 
-function redisEnv() {
-  const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || "";
-  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || "";
-  return url && token ? { url, token } : null;
+/**
+ * Finds Upstash REST credentials. Vercel names them KV_REST_API_URL/TOKEN, or
+ * <PREFIX>_KV_REST_API_URL/TOKEN when a custom prefix was chosen while connecting.
+ */
+export function redisEnv(env: NodeJS.ProcessEnv = process.env) {
+  const pairs: [string, string][] = [
+    ["KV_REST_API_URL", "KV_REST_API_TOKEN"],
+    ["UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"],
+  ];
+  for (const name of Object.keys(env)) {
+    const m = name.match(/^(.+_)(KV_REST_API_URL|UPSTASH_REDIS_REST_URL)$/);
+    if (m) pairs.push([name, m[1] + m[2].replace(/URL$/, "TOKEN")]);
+  }
+  for (const [urlKey, tokenKey] of pairs) {
+    const url = env[urlKey];
+    const token = env[tokenKey];
+    if (url && token) return { url, token };
+  }
+  return null;
 }
 
 class RedisAuthStore implements AuthStore {

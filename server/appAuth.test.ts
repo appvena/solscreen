@@ -13,7 +13,7 @@ import {
   verifySessionToken,
 } from "./appAuth";
 import { appRouter } from "./routers";
-import { getAuthStore, setAuthStoreForTests, type AuthStore, type StoredAuth } from "./authStore";
+import { getAuthStore, redisEnv, setAuthStoreForTests, type AuthStore, type StoredAuth } from "./authStore";
 import type { TrpcContext } from "./_core/context";
 
 let dir: string;
@@ -155,5 +155,11 @@ describe("app password", () => {
     expect(saved).toBe(before); // nothing overwritten
     failReads = false;
     expect(await verifyPassword("passwordbaru1")).toBe(true);
+  });
+
+  it("finds Upstash credentials under a custom Vercel prefix", () => {
+    expect(redisEnv({ STORAGE_KV_REST_API_URL: "https://a.upstash.io", STORAGE_KV_REST_API_TOKEN: "t" })).toEqual({ url: "https://a.upstash.io", token: "t" });
+    expect(redisEnv({ UPSTASH_REDIS_REST_URL: "https://b.upstash.io", UPSTASH_REDIS_REST_TOKEN: "u" })).toEqual({ url: "https://b.upstash.io", token: "u" });
+    expect(redisEnv({ KV_REST_API_URL: "https://c.upstash.io" })).toBeNull();
   });
 });

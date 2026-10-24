@@ -63,6 +63,32 @@ const formatIdr = (v: number) => `Rp${v.toLocaleString("id-ID", { maximumSignifi
 const formatUsdPrice = (v: number) => `$${v.toLocaleString("en-US", { maximumSignificantDigits: 4 })}`;
 const formatUsdShort = (v: number | null) => v === null ? "—" : v >= 1e6 ? `$${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `$${(v / 1e3).toFixed(1)}K` : `$${v.toFixed(0)}`;
 const formatUsdMoney = (v: number) => `US$${v.toLocaleString("id-ID", { minimumFractionDigits: 2, maximumFractionDigits: v < 1 ? 4 : 2 })}`;
+/** Copies text; falls back to a hidden textarea for browsers without the Clipboard API. */
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fall back below
+  }
+  try {
+    const el = document.createElement("textarea");
+    el.value = text;
+    el.setAttribute("readonly", "");
+    el.style.position = "fixed";
+    el.style.opacity = "0";
+    document.body.appendChild(el);
+    el.select();
+    el.setSelectionRange(0, text.length);
+    const ok = document.execCommand("copy");
+    el.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
 const shortMint = (mint: string) => `${mint.slice(0, 4)}...${mint.slice(-4)}`;
 const fmtChange = (v: number | null) => v === null ? "—" : `${v >= 0 ? "+" : ""}${v.toLocaleString("id-ID", { maximumFractionDigits: 1 })}%`;
 const accentFor = (mint: string) => {
@@ -370,12 +396,8 @@ export default function Home() {
   };
 
   const copyMint = async (mint: string) => {
-    try {
-      await navigator.clipboard.writeText(mint);
-      notify(`Alamat ${shortMint(mint)} disalin`);
-    } catch {
-      notify("Gagal menyalin — izin clipboard ditolak browser");
-    }
+    if (await copyText(mint)) notify(`Alamat lengkap disalin: ${mint}`);
+    else notify("Gagal menyalin — tekan lama alamat di detail token untuk menyalin manual");
   };
 
   const navLockUntil = useRef(0);
@@ -955,10 +977,14 @@ function DetailModal({ candidate, claudeReady, claudeModel, review, reviewing, r
             <div>
               <div className="eyebrow">REVIEW TOKEN / LIVE · {formatAgo(candidate.ageMinutes).toUpperCase()}</div>
               <h2 id="detail-title">{candidate.name} <span>{candidate.symbol}</span></h2>
-              <div className="mint-row"><code>{shortMint(candidate.mint)}</code><button type="button" className="mini-copy" onClick={onCopy} aria-label="Salin alamat mint"><Copy size={13} /></button></div>
             </div>
           </div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Tutup"><X size={18} /></button>
+        </div>
+        <div className="mint-full">
+          <span className="eyebrow">ALAMAT TOKEN (MINT)</span>
+          <code>{candidate.mint}</code>
+          <button type="button" className="outline-button no-margin" onClick={onCopy}><Copy size={13} /> Salin alamat</button>
         </div>
         <div className="detail-status-row">
           <span className={`risk-badge ${candidate.risk.toLowerCase()}`}><span /> {RISK_LABEL[candidate.risk]}</span>

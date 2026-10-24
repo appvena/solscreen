@@ -128,4 +128,14 @@ describe("Claude review", () => {
     expect(checkRateLimit("a", now + 30)).toBe(false);
     expect(checkRateLimit("b", now + 30)).toBe(true);
   });
+
+  it("manual deep review and manual re-scan require the app password", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-x");
+    vi.stubEnv("APP_PASSWORD", "rahasia123");
+    vi.stubEnv("VERCEL", "1");
+    const caller = appRouter.createCaller(ctx());
+    await expect(caller.ai.review({ mint: candidate.mint, mode: "deep" })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(caller.ai.review({ mint: candidate.mint, mode: "deep", password: "salah" })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(caller.screening.rescan({ password: "salah" })).rejects.toMatchObject({ code: "FORBIDDEN", message: "Password salah." });
+  });
 });

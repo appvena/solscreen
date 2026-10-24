@@ -29,6 +29,19 @@ import { getKv } from "./kv";
 import { getScanLog, getScreening } from "./screening";
 import { getUsageSummary, setBalance, takeDailyReviewSlot } from "./usage";
 
+/** Re-checks the app password for costly actions (shares the login brute-force limit). */
+async function confirmPassword(key: string, password: string) {
+  if (await loginBlocked(key)) {
+    throw new TRPCError({ code: "TOO_MANY_REQUESTS", message: "Terlalu banyak percobaan password salah. Coba lagi dalam 15 menit." });
+  }
+  const ok = password ? await verifyPassword(password).catch(() => false) : false;
+  if (!ok) {
+    await recordLoginFailure(key);
+    throw new TRPCError({ code: "FORBIDDEN", message: "Password salah." });
+  }
+  await clearLoginFailures(key);
+}
+
 export const appRouter = router({
   // All API routes live under /api/ so the gateway can route them correctly.
   system: systemRouter,
@@ -99,14 +112,25 @@ export const appRouter = router({
 
   /** Live screening of new Solana tokens (cached 15 min). */
   screening: router({
-    today: appProcedure
-      .input(z.object({ force: z.boolean().optional() }).optional())
-      .query(async ({ input }) => {
+    today: appProcedure.query(async () => {
+      try {
+        return await getScreening(false);
+      } catch (error) {
+        console.error("[Screening] gagal", error);
+        throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Gagal mengambil data token. Coba muat ulang sebentar lagi." });
+      }
+    }),
+
+    /** Manual re-scan — requires the app password again so it can't be triggered by accident. */
+    rescan: appProcedure
+      .input(z.object({ password: z.string().min(1).max(200) }))
+      .mutation(async ({ ctx, input }) => {
+        await confirmPassword(ctx.req.ip ?? "anon", input.password);
         try {
-          return await getScreening(input?.force === true);
+          return await getScreening(true, "manual");
         } catch (error) {
           console.error("[Screening] gagal", error);
-          throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Gagal mengambil data token. Coba muat ulang sebentar lagi." });
+          throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Gagal mengambil data token. Coba lagi sebentar." });
         }
       }),
     history: appProcedure.query(() => getScanLog()),
@@ -128,7 +152,12 @@ export const appRouter = router({
 
     /** Cached Claude review for a screened token; `mode: "deep"` re-runs with the stronger model. */
     review: appProcedure
-      .input(z.object({ mint: z.string().min(20).max(60), mode: z.enum(["auto", "deep"]).default("auto"), cachedOnly: z.boolean().optional() }))
+      .input(z.object({
+        mint: z.string().min(20).max(60),
+        mode: z.enum(["auto", "deep"]).default("auto"),
+        cachedOnly: z.boolean().optional(),
+        password: z.string().max(200).optional(),
+      }))
       .mutation(async ({ ctx, input }) => {
         const kv = getKv();
         const cacheKey = `solscreen:review:${input.mode}:${input.mint}`;
@@ -139,6 +168,8 @@ export const appRouter = router({
         if (!getClaudeStatus().configured) {
           throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Claude API belum dikonfigurasi. Isi ANTHROPIC_API_KEY di server." });
         }
+        // The expensive manual review needs the password re-entered.
+        if (input.mode === "deep") await confirmPassword(ctx.req.ip ?? "anon", input.password ?? "");
         const clientKey = ctx.req.ip ?? "anon";
         if (!checkRateLimit(clientKey)) {
           throw new TRPCError({ code: "TOO_MANY_REQUESTS", message: "Terlalu banyak permintaan review. Coba lagi dalam satu menit." });

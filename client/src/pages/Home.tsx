@@ -287,6 +287,7 @@ export default function Home() {
   const [reviewing, setReviewing] = useState<Record<string, boolean>>({});
   const [reviewErrors, setReviewErrors] = useState<Record<string, string>>({});
   const [refreshing, setRefreshing] = useState(false);
+  const [confirm, setConfirm] = useState<null | { title: string; description: string; action: (password: string) => Promise<void> }>(null);
 
   const utils = trpc.useUtils();
   const session = trpc.appAuth.session.useQuery(undefined, { refetchOnWindowFocus: false });
@@ -348,15 +349,17 @@ export default function Home() {
   }, [alerts, settings.push]);
 
   // --- Claude reviews: load cached ones, then auto-review new candidates. ---
-  const runReview = useCallback(async (mint: string, mode: "auto" | "deep", cachedOnly = false) => {
+  const runReview = useCallback(async (mint: string, mode: "auto" | "deep", cachedOnly = false, password?: string) => {
     if (!cachedOnly) setReviewing(r => ({ ...r, [mint]: true }));
     setReviewErrors(e => { const { [mint]: _drop, ...rest } = e; return rest; });
     try {
-      const result = await utils.client.ai.review.mutate({ mint, mode, cachedOnly });
+      const result = await utils.client.ai.review.mutate({ mint, mode, cachedOnly, password });
       if (result) setReviews(r => (mode === "auto" && r[mint]?.mode === "deep" ? r : { ...r, [mint]: result }));
-      return result;
+      return result as Review | null;
     } catch (error) {
-      if (!cachedOnly) setReviewErrors(e => ({ ...e, [mint]: error instanceof Error ? error.message : "Review gagal" }));
+      const message = error instanceof Error ? error.message : "Review gagal";
+      if (message === "Password salah." || /percobaan password/.test(message)) return message === "Password salah." ? "forbidden" as const : (setReviewErrors(e => ({ ...e, [mint]: message })), null);
+      if (!cachedOnly) setReviewErrors(e => ({ ...e, [mint]: message }));
       return null;
     } finally {
       if (!cachedOnly) {
@@ -388,18 +391,33 @@ export default function Home() {
     })();
   }, [data, claudeReady, settings.autoReview, runReview]);
 
-  const refresh = async () => {
-    setRefreshing(true);
-    try {
-      const fresh = await utils.screening.today.fetch({ force: true });
-      utils.screening.today.setData(undefined, fresh);
-      notify(`Dipindai ${formatClock(new Date(fresh.generatedAt))} · ${fresh.candidates.length} kandidat`);
-      void history.refetch();
-    } catch (error) {
-      notify(error instanceof Error ? error.message : "Gagal memuat ulang");
-    } finally {
-      setRefreshing(false);
-    }
+  const refresh = () => setConfirm({
+    title: "Pindai sekarang?",
+    description: "Pemindaian manual bisa memicu review Claude untuk token baru dan memakai kredit. Masukkan password aplikasi untuk melanjutkan.",
+    action: async password => {
+      setRefreshing(true);
+      try {
+        const fresh = await utils.client.screening.rescan.mutate({ password });
+        utils.screening.today.setData(undefined, fresh);
+        notify(`Dipindai ${formatClock(new Date(fresh.generatedAt))} · ${fresh.candidates.length} kandidat`);
+        void history.refetch();
+      } finally {
+        setRefreshing(false);
+      }
+    },
+  });
+
+  const requestReview = (mint: string, mode: "auto" | "deep") => {
+    if (mode === "auto") return void runReview(mint, "auto");
+    setConfirm({
+      title: "Review mendalam?",
+      description: "Review mendalam memakai model Claude yang lebih kuat dan lebih banyak pencarian web (± US$0,05–0,15 per token). Masukkan password aplikasi untuk melanjutkan.",
+      action: async password => {
+        // Validate the password first so a typo doesn't close the dialog.
+        const result = await runReview(mint, "deep", false, password);
+        if (result === "forbidden") throw new Error("Password salah.");
+      },
+    });
   };
 
   const copyMint = async (mint: string) => {
@@ -700,11 +718,13 @@ export default function Home() {
           review={reviews[selected.mint]}
           reviewing={reviewing[selected.mint] === true}
           reviewError={reviewErrors[selected.mint]}
-          onReview={mode => void runReview(selected.mint, mode)}
+          onReview={mode => requestReview(selected.mint, mode)}
           onClose={() => setSelectedMint(null)}
           onCopy={() => void copyMint(selected.mint)}
         />
       )}
+
+      {confirm && <PasswordPrompt {...confirm} onClose={() => setConfirm(null)} />}
 
       <div className="toast-region" role="status" aria-live="polite">
         {toast && <div className="toast"><Check size={15} /> {toast}</div>}
@@ -714,45 +734,70 @@ export default function Home() {
 }
 
 // ---------------------------------------------------------------------------
-// Claude credit meter
+// Claude credit: the accurate balance lives in the Claude Console.
 // ---------------------------------------------------------------------------
-function CreditCard({ usage, loading, claudeReady, notify }: { usage?: Usage; loading: boolean; claudeReady: boolean; notify: (m: string) => void }) {
-  const utils = trpc.useUtils();
-  const [editing, setEditing] = useState(false);
-  const [amount, setAmount] = useState("");
-  const setBalance = trpc.ai.setBalance.useMutation({
-    onSuccess: data => { utils.ai.usage.setData(undefined, data); setEditing(false); setAmount(""); notify("Saldo kredit disimpan"); },
-  });
-  const remaining = usage?.remainingUsd ?? null;
-  const pct = usage?.balance && usage.balance.amountUsd > 0 && remaining !== null ? Math.max(0, Math.min(100, (remaining / usage.balance.amountUsd) * 100)) : null;
-  const totalTokens = (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0);
+const CONSOLE_BILLING_URL = "https://platform.claude.com/settings/billing";
 
+function CreditCard({ usage, loading, claudeReady }: { usage?: Usage; loading: boolean; claudeReady: boolean; notify?: (m: string) => void }) {
+  const totalTokens = (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0);
   return (
     <div className="rail-card credit-card">
       <div className="rail-card-head"><span className="eyebrow">KREDIT CLAUDE</span><Coins size={16} /></div>
-      {loading ? <p>Memuat…</p> : (
-        <>
-          <div className="confidence-value">{remaining !== null ? formatUsdMoney(remaining) : formatUsdMoney(usage?.costUsd ?? 0)}<span>{remaining !== null ? " sisa (perkiraan)" : " terpakai"}</span></div>
-          {pct !== null && <div className="confidence-bar"><span style={{ width: `${pct}%` }} /></div>}
-          <div className="credit-lines">
-            <div><span>Terpakai</span><strong>{formatUsdMoney(usage?.spentSinceBalanceUsd ?? usage?.costUsd ?? 0)}</strong></div>
-            <div><span>Token</span><strong>{totalTokens.toLocaleString("id-ID")}</strong></div>
-            <div><span>Panggilan · riset web</span><strong>{usage?.calls ?? 0} · {usage?.webSearches ?? 0}</strong></div>
-          </div>
-          {!usage?.persistent && <p className="credit-warn"><AlertTriangle size={12} /> Penghitung tersimpan di memori server dan bisa ter-reset. Hubungkan Upstash Redis agar akurat.</p>}
-          {!claudeReady && <p className="credit-warn"><AlertTriangle size={12} /> Claude belum diatur — belum ada pemakaian.</p>}
-          {editing ? (
-            <form className="credit-form" onSubmit={e => { e.preventDefault(); const v = Number(amount.replace(",", ".")); if (Number.isFinite(v) && v >= 0) setBalance.mutate({ amountUsd: v }); }}>
-              <span>US$</span>
-              <input autoFocus inputMode="decimal" value={amount} onChange={e => setAmount(e.target.value)} placeholder="mis. 5,00" aria-label="Saldo kredit saat ini (USD)" />
-              <button type="submit" className="add-chip" aria-label="Simpan saldo" disabled={setBalance.isPending}><Check size={14} /></button>
-            </form>
-          ) : (
-            <button type="button" className="text-button" onClick={() => setEditing(true)}>{usage?.balance ? "Perbarui saldo dari Console" : "Isi saldo dari Console"} <ChevronRight size={14} /></button>
-          )}
-          <p className="credit-note">Anthropic tidak menyediakan API saldo, jadi ini dihitung dari pemakaian aplikasi × harga resmi. Cocokkan sesekali dengan platform.claude.com.</p>
-        </>
+      <p>Saldo dan tagihan yang akurat hanya ada di Claude Console — angka resmi dari Anthropic.</p>
+      <a className="primary-button credit-link" href={CONSOLE_BILLING_URL} target="_blank" rel="noopener noreferrer">
+        <Coins size={14} /> Cek saldo di Claude Console <ExternalLink size={13} />
+      </a>
+      {!loading && (
+        <div className="credit-lines">
+          <div><span>Review Claude oleh app</span><strong>{usage?.calls ?? 0}×</strong></div>
+          <div><span>Pencarian web</span><strong>{usage?.webSearches ?? 0}× (US$0,01/cari)</strong></div>
+          <div><span>Token diproses</span><strong>{totalTokens.toLocaleString("id-ID")}</strong></div>
+        </div>
       )}
+      {!claudeReady && <p className="credit-warn"><AlertTriangle size={12} /> Claude belum diatur — belum ada pemakaian.</p>}
+      <p className="credit-note">Biaya terbesar berasal dari pencarian web saat review. Matikan "Review Claude otomatis" di Pengaturan alert untuk menghemat kredit.</p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Password confirmation for costly actions
+// ---------------------------------------------------------------------------
+function PasswordPrompt({ title, description, action, onClose }: { title: string; description: string; action: (password: string) => Promise<void>; onClose: () => void }) {
+  const ref = useDialog(true, onClose);
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async () => {
+    if (!password) return;
+    setBusy(true);
+    setError("");
+    try {
+      await action(password);
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Gagal");
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="modal-backdrop" onClick={() => !busy && onClose()}>
+      <section ref={ref as RefObject<HTMLElement>} className="detail-modal confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" onClick={e => e.stopPropagation()}>
+        <div className="modal-top">
+          <div><div className="eyebrow">KONFIRMASI</div><h2 id="confirm-title">{title}</h2></div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Batal" disabled={busy}><X size={18} /></button>
+        </div>
+        <p className="drawer-copy">{description}</p>
+        <form className="password-form" noValidate onSubmit={e => { e.preventDefault(); void submit(); }}>
+          <input type="text" name="username" autoComplete="username" value="solscreen" readOnly hidden />
+          <label>Password aplikasi<input type="password" autoComplete="current-password" value={password} onChange={e => { setPassword(e.target.value); setError(""); }} disabled={busy} /></label>
+          <div className="field-error" role="alert">{error}</div>
+          <div className="password-actions">
+            <button type="button" className="ghost-button" onClick={onClose} disabled={busy}>Batal</button>
+            <button type="submit" className="primary-button" disabled={!password || busy}>{busy ? <Loader2 size={14} className="spin" /> : <KeyRound size={14} />} Lanjutkan</button>
+          </div>
+        </form>
+      </section>
     </div>
   );
 }

@@ -38,7 +38,7 @@ import { trpc } from "@/lib/trpc";
 import type { AppRouter } from "../../../server/routers";
 
 type Outputs = inferRouterOutputs<AppRouter>;
-type Screening = Outputs["screening"]["today"];
+type Screening = NonNullable<Outputs["screening"]["today"]>;
 type Candidate = Screening["candidates"][number];
 type Review = NonNullable<Outputs["ai"]["review"]>;
 type Usage = Outputs["ai"]["usage"];
@@ -110,7 +110,8 @@ const RISK_LABEL: Record<Candidate["risk"], string> = { Low: "Risiko rendah", Me
 type AlertSettings = {
   thresholds: number[];
   downThreshold: number;
-  frequencyMinutes: 15 | 30 | 60;
+  /** Mirrors the server-side automatic scan setting (0 = off). */
+  frequencyMinutes: 0 | 15 | 30 | 60;
   push: boolean;
   autoReview: boolean;
 };
@@ -297,16 +298,20 @@ export default function Home() {
   const claudeStatus = trpc.ai.status.useQuery(undefined, { retry: false, refetchOnWindowFocus: false });
   const claudeReady = claudeStatus.data?.configured === true;
   const usage = trpc.ai.usage.useQuery(undefined, { refetchOnWindowFocus: false, refetchInterval: 60_000 });
+  const automation = trpc.settings.automation.useQuery(undefined, { refetchOnWindowFocus: false });
+  const autoScanMinutes = automation.data?.autoScanMinutes ?? 15;
+  const autoReviewOn = automation.data?.autoReview ?? true;
+  const setAutomation = trpc.settings.setAutomation.useMutation({ onSuccess: next => utils.settings.automation.setData(undefined, next) });
   const screening = trpc.screening.today.useQuery(undefined, {
     refetchOnWindowFocus: false,
     staleTime: 5 * 60_000,
-    refetchInterval: settings.frequencyMinutes * 60_000,
+    refetchInterval: autoScanMinutes > 0 ? autoScanMinutes * 60_000 : false,
     retry: 1,
   });
-  const data = screening.data;
+  const data = screening.data ?? undefined;
   const history = trpc.screening.history.useQuery(undefined, { refetchOnWindowFocus: false });
   useEffect(() => { if (data) void history.refetch(); }, [data?.generatedAt]); // eslint-disable-line react-hooks/exhaustive-deps
-  const nextScanAt = data ? new Date(Math.max(Date.parse(data.nextScanAt), Date.parse(data.generatedAt) + settings.frequencyMinutes * 60_000)) : null;
+  const nextScanAt = data?.nextScanAt && autoScanMinutes > 0 ? new Date(data.nextScanAt) : null;
   const candidates = useMemo(() => data?.candidates ?? [], [data]);
   const lastSync = data ? new Date(data.generatedAt) : null;
 
@@ -349,11 +354,11 @@ export default function Home() {
   }, [alerts, settings.push]);
 
   // --- Claude reviews: load cached ones, then auto-review new candidates. ---
-  const runReview = useCallback(async (mint: string, mode: "auto" | "deep", cachedOnly = false, password?: string) => {
+  const runReview = useCallback(async (mint: string, mode: "auto" | "deep", cachedOnly = false, password?: string, manual = false) => {
     if (!cachedOnly) setReviewing(r => ({ ...r, [mint]: true }));
     setReviewErrors(e => { const { [mint]: _drop, ...rest } = e; return rest; });
     try {
-      const result = await utils.client.ai.review.mutate({ mint, mode, cachedOnly, password });
+      const result = await utils.client.ai.review.mutate({ mint, mode, cachedOnly, password, manual: manual || mode === "deep" });
       if (result) setReviews(r => (mode === "auto" && r[mint]?.mode === "deep" ? r : { ...r, [mint]: result }));
       return result as Review | null;
     } catch (error) {
@@ -383,13 +388,13 @@ export default function Home() {
         if (!deep) await runReview(mint, "auto", true);
       }
       // 2) new automatic reviews, two at a time
-      if (!claudeReady || !settings.autoReview) return;
+      if (!claudeReady || !autoReviewOn) return;
       const pending = mints.filter(m => !reviewsRef.current[m]);
       for (let i = 0; i < pending.length; i += 2) {
         await Promise.all(pending.slice(i, i + 2).map(m => runReview(m, "auto")));
       }
     })();
-  }, [data, claudeReady, settings.autoReview, runReview]);
+  }, [data, claudeReady, autoReviewOn, runReview]);
 
   const refresh = () => setConfirm({
     title: "Pindai sekarang?",
@@ -398,6 +403,7 @@ export default function Home() {
       setRefreshing(true);
       try {
         const fresh = await utils.client.screening.rescan.mutate({ password });
+        if (!fresh) throw new Error("Pemindaian gagal.");
         utils.screening.today.setData(undefined, fresh);
         notify(`Dipindai ${formatClock(new Date(fresh.generatedAt))} · ${fresh.candidates.length} kandidat`);
         void history.refetch();
@@ -408,7 +414,7 @@ export default function Home() {
   });
 
   const requestReview = (mint: string, mode: "auto" | "deep") => {
-    if (mode === "auto") return void runReview(mint, "auto");
+    if (mode === "auto") return void runReview(mint, "auto", false, undefined, true);
     setConfirm({
       title: "Review mendalam?",
       description: "Review mendalam memakai model Claude yang lebih kuat dan lebih banyak pencarian web (± US$0,05–0,15 per token). Masukkan password aplikasi untuk melanjutkan.",
@@ -537,7 +543,7 @@ export default function Home() {
 
           <section className="scan-strip" aria-label="Waktu pemindaian">
             <div><span className="eyebrow">TERAKHIR DIPINDAI</span><strong>{lastSync ? `${formatClock(lastSync)} ${zoneLabel()}` : screening.isLoading ? "memindai…" : "—"}</strong></div>
-            <div><span className="eyebrow">BERIKUTNYA</span><strong>{nextScanAt ? `± ${formatHm(nextScanAt)} ${zoneLabel()}` : "—"}</strong><small>saat aplikasi terbuka</small></div>
+            <div><span className="eyebrow">BERIKUTNYA</span><strong>{autoScanMinutes === 0 ? "Otomatis mati" : nextScanAt ? `± ${formatHm(nextScanAt)} ${zoneLabel()}` : "—"}</strong><small>{autoScanMinutes === 0 ? "hanya lewat Pindai sekarang" : `tiap ${autoScanMinutes} mnt, saat aplikasi terbuka`} · review otomatis {autoReviewOn ? "nyala" : "mati"}</small></div>
             <div><span className="eyebrow">HASIL</span><strong>{data ? `${counts.lolos} lolos · ${counts.pantau} pantau` : "—"}</strong></div>
             <button type="button" className="primary-button" onClick={() => void refresh()} disabled={refreshing || screening.isFetching}>
               <RefreshCw size={14} className={refreshing || screening.isFetching ? "spin" : ""} /> {refreshing ? "Memindai…" : "Pindai sekarang"}
@@ -594,6 +600,13 @@ export default function Home() {
               {filtered.map(c => (
                 <CandidateCard key={c.mint} candidate={c} review={reviews[c.mint]} reviewing={reviewing[c.mint] === true} onOpen={() => setSelectedMint(c.mint)} onCopy={() => void copyMint(c.mint)} />
               ))}
+              {screening.isSuccess && !screening.data && (
+                <div className="empty-state">
+                  <Clock3 size={22} />
+                  <strong>Belum ada hasil pemindaian</strong>
+                  <span>Pemindaian otomatis sedang mati. Tekan "Pindai sekarang" untuk memindai.</span>
+                </div>
+              )}
               {data && filtered.length === 0 && (
                 <div className="empty-state">
                   <Search size={22} />
@@ -671,7 +684,9 @@ export default function Home() {
                   </div>
                 ))}
               </div>
-              <p className="integration-copy">Saat ini pemindaian berjalan ketika aplikasi dibuka, otomatis tiap {settings.frequencyMinutes} menit selama aplikasi terbuka, atau saat Anda menekan "Pindai sekarang". Zona waktu: {zoneLabel()}.</p>
+              <p className="integration-copy">{autoScanMinutes === 0
+                ? "Pemindaian otomatis mati: aplikasi hanya menampilkan hasil terakhir, pemindaian baru hanya lewat \"Pindai sekarang\" (dengan password)."
+                : `Pemindaian berjalan saat aplikasi dibuka bila hasil terakhir lebih dari ${autoScanMinutes} menit, otomatis tiap ${autoScanMinutes} menit selama aplikasi terbuka, atau lewat "Pindai sekarang".`} Atur di Pengaturan → Otomatisasi. Zona waktu: {zoneLabel()}.</p>
             </div>
           </section>
 
@@ -694,12 +709,21 @@ export default function Home() {
 
       {settingsOpen && (
         <SettingsDrawer
-          initial={settings}
+          initial={{ ...settings, frequencyMinutes: autoScanMinutes as AlertSettings["frequencyMinutes"], autoReview: autoReviewOn }}
           onClose={() => { setSettingsOpen(false); setSecurityFocus(false); }}
           onSave={next => {
             setSettings(next);
             setSettingsOpen(false);
-            notify(saveSettings(next) ? "Pengaturan alert disimpan di browser ini" : "Pengaturan diterapkan, tetapi browser menolak penyimpanan");
+            saveSettings(next);
+            if (next.frequencyMinutes !== autoScanMinutes || next.autoReview !== autoReviewOn) {
+              setAutomation.mutate(
+                { autoScanMinutes: next.frequencyMinutes, autoReview: next.autoReview },
+                {
+                  onSuccess: () => notify("Pengaturan disimpan (otomatisasi berlaku di semua perangkat)"),
+                  onError: e => notify(`Otomatisasi gagal disimpan: ${e.message}`),
+                },
+              );
+            } else notify("Pengaturan disimpan");
           }}
           notify={notify}
           focusSecurity={securityFocus}
@@ -755,7 +779,7 @@ function CreditCard({ usage, loading, claudeReady }: { usage?: Usage; loading: b
         </div>
       )}
       {!claudeReady && <p className="credit-warn"><AlertTriangle size={12} /> Claude belum diatur — belum ada pemakaian.</p>}
-      <p className="credit-note">Biaya terbesar berasal dari pencarian web saat review. Matikan "Review Claude otomatis" di Pengaturan alert untuk menghemat kredit.</p>
+      <p className="credit-note">Biaya terbesar berasal dari pencarian web saat review. Matikan "Review Claude otomatis" di Pengaturan → Otomatisasi untuk menghemat kredit.</p>
     </div>
   );
 }
@@ -859,10 +883,25 @@ function SettingsDrawer({ initial, onClose, onSave, notify, focusSecurity, minPa
     <div className="drawer-backdrop" onClick={onClose}>
       <aside ref={ref as RefObject<HTMLElement>} className="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="settings-title" onClick={event => event.stopPropagation()}>
         <div className="drawer-heading">
-          <div><div className="eyebrow">PENGATURAN WORKSPACE</div><h2 id="settings-title">Kontrol alert</h2></div>
+          <div><div className="eyebrow">PENGATURAN WORKSPACE</div><h2 id="settings-title">Pengaturan</h2></div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Tutup"><X size={18} /></button>
         </div>
-        <p className="drawer-copy">Atur pemicu notifikasi untuk watchlist. Pengaturan disimpan di browser ini (localStorage) sampai backend tersedia.</p>
+        <div className="setting-group automation-group">
+          <div className="setting-label">Otomatisasi <span className="setting-badge">semua perangkat</span></div>
+          <p className="setting-help">Semua yang memakai kredit Claude atau memindai tanpa Anda tekan tombol. Dimatikan = benar-benar berhenti (ditegakkan di server).</p>
+          <div className="setting-sublabel">Pemindaian otomatis</div>
+          <div className="frequency-grid four">
+            {([0, 15, 30, 60] as const).map(item => (
+              <button type="button" key={item} aria-pressed={draft.frequencyMinutes === item} className={`frequency-option ${draft.frequencyMinutes === item ? "selected" : ""}`} onClick={() => setDraft(d => ({ ...d, frequencyMinutes: item }))}>
+                {item === 0 ? "Mati" : `${item} mnt`}{draft.frequencyMinutes === item && <Check size={14} />}
+              </button>
+            ))}
+          </div>
+          <div className="toggle-row"><span><Sparkles size={16} /> Review Claude otomatis</span><Switch label="Review Claude otomatis" checked={draft.autoReview} onChange={next => setDraft(d => ({ ...d, autoReview: next }))} /></div>
+          <p className="setting-help">{draft.frequencyMinutes === 0 ? "Aplikasi hanya menampilkan hasil terakhir. Pindai baru hanya lewat tombol \"Pindai sekarang\" (dengan password)." : `Pindai baru bila hasil terakhir lebih dari ${draft.frequencyMinutes} menit, selama aplikasi terbuka.`} {draft.autoReview ? "Token baru langsung direview Claude (± US$0,03/token)." : "Claude hanya berjalan saat Anda menekan tombol review."}</p>
+        </div>
+
+        <p className="drawer-copy">Ambang alert dan notifikasi di bawah ini disimpan di browser/perangkat ini.</p>
 
         <div className="setting-group">
           <div className="setting-label">Alert kenaikan harga</div>
@@ -899,20 +938,8 @@ function SettingsDrawer({ initial, onClose, onSave, notify, focusSecurity, minPa
         </div>
 
         <div className="setting-group">
-          <div className="setting-label">Pindai ulang otomatis (saat aplikasi terbuka)</div>
-          <div className="frequency-grid">
-            {([15, 30, 60] as const).map(item => (
-              <button type="button" key={item} aria-pressed={draft.frequencyMinutes === item} className={`frequency-option ${draft.frequencyMinutes === item ? "selected" : ""}`} onClick={() => setDraft(d => ({ ...d, frequencyMinutes: item }))}>
-                {item} menit{draft.frequencyMinutes === item && <Check size={14} />}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="setting-group">
           <div className="setting-label">Notifikasi</div>
           <div className="toggle-row"><span><Bell size={16} /> Notifikasi push browser</span><Switch label="Notifikasi push browser" checked={draft.push} onChange={next => void togglePush(next)} disabled={!notificationsSupported} /></div>
-          <div className="toggle-row"><span><Sparkles size={16} /> Review Claude otomatis</span><Switch label="Review Claude otomatis" checked={draft.autoReview} onChange={next => setDraft(d => ({ ...d, autoReview: next }))} /></div>
           <div className="toggle-row muted"><span><MessageCircle size={16} /> Telegram (segera hadir)</span><Switch label="Telegram, segera hadir" checked={false} onChange={() => undefined} disabled /></div>
         </div>
 

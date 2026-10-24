@@ -26,7 +26,8 @@ import {
   reviewCandidate,
 } from "./claudeReview";
 import { getKv } from "./kv";
-import { getScanLog, getScreening } from "./screening";
+import { findCandidate, getScanLog, getScreening } from "./screening";
+import { getAutomation, setAutomation } from "./automation";
 import { getUsageSummary, setBalance, takeDailyReviewSlot } from "./usage";
 
 /** Re-checks the app password for costly actions (shares the login brute-force limit). */
@@ -136,6 +137,14 @@ export const appRouter = router({
     history: appProcedure.query(() => getScanLog()),
   }),
 
+  /** Automation switches (server-side, all devices). */
+  settings: router({
+    automation: appProcedure.query(() => getAutomation()),
+    setAutomation: appProcedure
+      .input(z.object({ autoScanMinutes: z.union([z.literal(0), z.literal(15), z.literal(30), z.literal(60)]), autoReview: z.boolean() }))
+      .mutation(({ input }) => setAutomation(input)),
+  }),
+
   ai: router({
     /** Whether the Claude API key is configured (never returns the key itself). */
     status: appProcedure.query(() => getClaudeStatus()),
@@ -156,6 +165,8 @@ export const appRouter = router({
         mint: z.string().min(20).max(60),
         mode: z.enum(["auto", "deep"]).default("auto"),
         cachedOnly: z.boolean().optional(),
+        /** Set when the operator pressed a review button (vs. automatic background review). */
+        manual: z.boolean().optional(),
         password: z.string().max(200).optional(),
       }))
       .mutation(async ({ ctx, input }) => {
@@ -170,13 +181,15 @@ export const appRouter = router({
         }
         // The expensive manual review needs the password re-entered.
         if (input.mode === "deep") await confirmPassword(ctx.req.ip ?? "anon", input.password ?? "");
+        else if (!input.manual && !(await getAutomation()).autoReview) {
+          throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Review Claude otomatis sedang dimatikan." });
+        }
         const clientKey = ctx.req.ip ?? "anon";
         if (!checkRateLimit(clientKey)) {
           throw new TRPCError({ code: "TOO_MANY_REQUESTS", message: "Terlalu banyak permintaan review. Coba lagi dalam satu menit." });
         }
         // Only review tokens that are actually in today's screening (server-side data, not client input).
-        const screening = await getScreening();
-        const candidate = screening.candidates.find(c => c.mint === input.mint);
+        const candidate = await findCandidate(input.mint);
         if (!candidate) {
           throw new TRPCError({ code: "NOT_FOUND", message: "Token ini sudah tidak ada di hasil screening terbaru. Muat ulang daftar." });
         }

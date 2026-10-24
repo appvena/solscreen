@@ -2,7 +2,9 @@ import Anthropic from "@anthropic-ai/sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { appRouter } from "./routers";
 import { checkRateLimit, resetRateLimit, reviewCandidate } from "./claudeReview";
-import { createMemoryKv, setKvForTests } from "./kv";
+import { createMemoryKv, getKv, setKvForTests } from "./kv";
+import { setAutomation } from "./automation";
+import { getScreening } from "./screening";
 import { estimateCostUsd, getUsageSummary, setBalance } from "./usage";
 import type { TokenCandidate } from "./screening/analyze";
 import type { TrpcContext } from "./_core/context";
@@ -137,5 +139,17 @@ describe("Claude review", () => {
     await expect(caller.ai.review({ mint: candidate.mint, mode: "deep" })).rejects.toMatchObject({ code: "FORBIDDEN" });
     await expect(caller.ai.review({ mint: candidate.mint, mode: "deep", password: "salah" })).rejects.toMatchObject({ code: "FORBIDDEN" });
     await expect(caller.screening.rescan({ password: "salah" })).rejects.toMatchObject({ code: "FORBIDDEN", message: "Password salah." });
+  });
+
+  it("automation off: no scan on open and no automatic Claude review", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-x");
+    await setAutomation({ autoScanMinutes: 0, autoReview: false });
+    expect(await getScreening(false)).toBeNull(); // nothing stored yet, and no scan is started
+    await getKv().set("solscreen:screening:last:v3", { generatedAt: new Date(Date.now() - 6 * 3600_000).toISOString(), candidates: [candidate], sources: [] });
+    const last = await getScreening(false);
+    expect(last).toMatchObject({ cached: true, nextScanAt: null, autoScanMinutes: 0 });
+    const caller = appRouter.createCaller(ctx());
+    await expect(caller.ai.review({ mint: candidate.mint, mode: "auto" })).rejects.toMatchObject({ code: "PRECONDITION_FAILED", message: "Review Claude otomatis sedang dimatikan." });
+    expect(await caller.settings.automation()).toEqual({ autoScanMinutes: 0, autoReview: false });
   });
 });

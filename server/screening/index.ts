@@ -1,3 +1,4 @@
+import { getAutomation } from "../automation";
 import { getKv } from "../kv";
 import { analyzeToken, prefilter, RULES, type TokenCandidate } from "./analyze";
 import {
@@ -27,7 +28,7 @@ export type ScreeningResult = {
   rules: typeof RULES;
 };
 
-const CACHE_KEY = "solscreen:screening:v2";
+const CACHE_KEY = "solscreen:screening:last:v3";
 const LOG_KEY = "solscreen:screening:log";
 export const SCAN_CACHE_MINUTES = 15;
 
@@ -36,7 +37,6 @@ export type ScanLogEntry = { at: string; scanned: number; lolos: number; pantau:
 export async function getScanLog(): Promise<ScanLogEntry[]> {
   return (await getKv().get<ScanLogEntry[]>(LOG_KEY).catch(() => null)) ?? [];
 }
-const CACHE_SECONDS = SCAN_CACHE_MINUTES * 60;
 const MAX_RUGCHECK = 18;
 
 export type ScreeningDeps = {
@@ -127,21 +127,31 @@ export async function runScreening(deps: ScreeningDeps = defaultDeps): Promise<S
 
 let inflight: Promise<ScreeningResult> | null = null;
 
-const nextScan = (generatedAt: string) => new Date(Date.parse(generatedAt) + CACHE_SECONDS * 1000).toISOString();
+export type ScreeningResponse = ScreeningResult & { cached: boolean; nextScanAt: string | null; autoScanMinutes: number };
 
-/** Cached screening (15 min). `force` bypasses the cache (manual refresh). */
-export async function getScreening(force = false, trigger: ScanLogEntry["trigger"] = force ? "manual" : "buka"): Promise<ScreeningResult & { cached: boolean; nextScanAt: string }> {
+const nextScan = (generatedAt: string, minutes: number) => (minutes > 0 ? new Date(Date.parse(generatedAt) + minutes * 60_000).toISOString() : null);
+
+/**
+ * Returns the latest screening. A new scan runs only when `force` is set (manual,
+ * password-confirmed) or automatic scanning is on and the last result is older
+ * than `autoScanMinutes`. With automatic scanning off, opening the app only
+ * shows the last result (or null if there has never been a scan).
+ */
+export async function getScreening(force = false, trigger: ScanLogEntry["trigger"] = force ? "manual" : "buka"): Promise<ScreeningResponse | null> {
   const kv = getKv();
+  const { autoScanMinutes } = await getAutomation();
   if (!force) {
-    const hit = await kv.get<ScreeningResult>(CACHE_KEY).catch(() => null);
-    if (hit) return { ...hit, cached: true, nextScanAt: nextScan(hit.generatedAt) };
+    const last = await kv.get<ScreeningResult>(CACHE_KEY).catch(() => null);
+    const fresh = last && Date.now() - Date.parse(last.generatedAt) < Math.max(autoScanMinutes, SCAN_CACHE_MINUTES) * 60_000;
+    if (last && (autoScanMinutes === 0 || fresh)) return { ...last, cached: true, nextScanAt: nextScan(last.generatedAt, autoScanMinutes), autoScanMinutes };
+    if (autoScanMinutes === 0) return null;
   }
   if (!inflight) {
     inflight = runScreening().finally(() => { inflight = null; });
   }
   const fresh = await inflight;
-  // Don't cache a run where every source failed.
-  if (fresh.sources.some(s => s.ok && s.count > 0)) await kv.set(CACHE_KEY, fresh, CACHE_SECONDS).catch(() => undefined);
+  // Keep the last good result (no expiry: it is shown when automatic scanning is off).
+  if (fresh.sources.some(s => s.ok && s.count > 0)) await kv.set(CACHE_KEY, fresh).catch(() => undefined);
   const entry: ScanLogEntry = {
     at: fresh.generatedAt,
     scanned: fresh.scanned,
@@ -154,5 +164,11 @@ export async function getScreening(force = false, trigger: ScanLogEntry["trigger
   };
   const log = await getScanLog();
   if (log[0]?.at !== entry.at) await kv.set(LOG_KEY, [entry, ...log].slice(0, 30)).catch(() => undefined);
-  return { ...fresh, cached: false, nextScanAt: nextScan(fresh.generatedAt) };
+  return { ...fresh, cached: false, nextScanAt: nextScan(fresh.generatedAt, autoScanMinutes), autoScanMinutes };
+}
+
+/** Finds a candidate in the stored result without triggering a scan. */
+export async function findCandidate(mint: string) {
+  const last = await getKv().get<ScreeningResult>(CACHE_KEY).catch(() => null);
+  return last?.candidates.find(c => c.mint === mint) ?? null;
 }

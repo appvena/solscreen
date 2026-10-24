@@ -248,13 +248,14 @@ function Switch({ checked, onChange, disabled, label }: { checked: boolean; onCh
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
-type NavKey = "overview" | "candidates" | "alerts" | "sources";
+type NavKey = "overview" | "candidates" | "bonding" | "alerts" | "sources";
 const NAV_MONITOR: { key: NavKey; label: string; icon: typeof LayoutDashboard }[] = [
   { key: "overview", label: "Ringkasan", icon: LayoutDashboard },
   { key: "candidates", label: "Kandidat", icon: Target },
+  { key: "bonding", label: "Hampir rilis", icon: Zap },
   { key: "alerts", label: "Alert", icon: Bell },
 ];
-const NAV_LABEL: Record<NavKey, string> = { overview: "Ringkasan", candidates: "Kandidat", alerts: "Alert", sources: "Sumber data" };
+const NAV_LABEL: Record<NavKey, string> = { overview: "Ringkasan", candidates: "Kandidat", bonding: "Hampir rilis", alerts: "Alert", sources: "Sumber data" };
 
 type AlertEvent = { key: string; symbol: string; mint: string; trigger: string; move: number; kind: "up" | "down" };
 
@@ -313,6 +314,7 @@ export default function Home() {
   useEffect(() => { if (data) void history.refetch(); }, [data?.generatedAt]); // eslint-disable-line react-hooks/exhaustive-deps
   const nextScanAt = data?.nextScanAt && autoScanMinutes > 0 ? new Date(data.nextScanAt) : null;
   const candidates = useMemo(() => data?.candidates ?? [], [data]);
+  const nearGraduation = useMemo(() => data?.nearGraduation ?? [], [data]);
   const lastSync = data ? new Date(data.generatedAt) : null;
 
   const notify = useCallback((message: string) => {
@@ -335,7 +337,7 @@ export default function Home() {
     pantau: candidates.filter(c => c.status === "Pantau").length,
   }), [candidates]);
 
-  const alerts = useMemo(() => deriveAlerts(candidates, settings), [candidates, settings]);
+  const alerts = useMemo(() => deriveAlerts([...candidates, ...nearGraduation], settings), [candidates, nearGraduation, settings]);
   const unreadAlerts = alerts.filter(a => !readAlerts.has(a.key)).length;
 
   // Browser push for new alerts (only when enabled and permitted).
@@ -380,7 +382,7 @@ export default function Home() {
   useEffect(() => {
     if (!data || autoRanFor.current === data.generatedAt) return;
     autoRanFor.current = data.generatedAt;
-    const mints = data.candidates.slice(0, AUTO_REVIEW_MAX).map(c => c.mint);
+    const mints = [...data.candidates.slice(0, AUTO_REVIEW_MAX), ...(data.nearGraduation ?? []).slice(0, 3)].map(c => c.mint);
     void (async () => {
       // 1) cached reviews (deep first, then auto) — free
       for (const mint of mints) {
@@ -442,7 +444,7 @@ export default function Home() {
   };
 
   useEffect(() => {
-    const ids: NavKey[] = ["candidates", "sources", "alerts"];
+    const ids: NavKey[] = ["candidates", "sources", "bonding", "alerts"];
     const onScroll = () => {
       if (Date.now() < navLockUntil.current) return;
       const line = window.innerHeight * 0.35;
@@ -472,7 +474,7 @@ export default function Home() {
         : { name: "Claude API", meta: claudeStatus.isError ? "Server tidak terjangkau" : "API key belum diatur di server", tone: "bad" },
   ];
   const healthyCount = sourceRows.filter(s => s.tone === "good").length;
-  const selected = selectedMint ? candidates.find(c => c.mint === selectedMint) ?? null : null;
+  const selected = selectedMint ? candidates.find(c => c.mint === selectedMint) ?? nearGraduation.find(c => c.mint === selectedMint) ?? null : null;
   const allSourcesDown = data && data.sources.length > 0 && data.sources.every(s => !s.ok);
 
   return (
@@ -544,7 +546,7 @@ export default function Home() {
           <section className="scan-strip" aria-label="Waktu pemindaian">
             <div><span className="eyebrow">TERAKHIR DIPINDAI</span><strong>{lastSync ? `${formatClock(lastSync)} ${zoneLabel()}` : screening.isLoading ? "memindai…" : "—"}</strong></div>
             <div><span className="eyebrow">BERIKUTNYA</span><strong>{autoScanMinutes === 0 ? "Otomatis mati" : nextScanAt ? `± ${formatHm(nextScanAt)} ${zoneLabel()}` : "—"}</strong><small>{autoScanMinutes === 0 ? "hanya lewat Pindai sekarang" : `tiap ${autoScanMinutes} mnt, saat aplikasi terbuka`} · review otomatis {autoReviewOn ? "nyala" : "mati"}</small></div>
-            <div><span className="eyebrow">HASIL</span><strong>{data ? `${counts.lolos} lolos · ${counts.pantau} pantau` : "—"}</strong></div>
+            <div><span className="eyebrow">HASIL</span><strong>{data ? `${counts.lolos} lolos · ${counts.pantau} pantau` : "—"}</strong>{data && <small>{nearGraduation.length} hampir rilis (pump.fun)</small>}</div>
             <button type="button" className="primary-button" onClick={() => void refresh()} disabled={refreshing || screening.isFetching}>
               <RefreshCw size={14} className={refreshing || screening.isFetching ? "spin" : ""} /> {refreshing ? "Memindai…" : "Pindai sekarang"}
             </button>
@@ -647,6 +649,27 @@ export default function Home() {
                 <button type="button" className="outline-button" onClick={() => setSettingsOpen(true)}>Ubah ambang alert <Settings2 size={14} /></button>
               </div>
             </aside>
+          </section>
+
+          <div className="section-heading candidate-heading bonding-heading" id="section-bonding">
+            <div>
+              <div className="eyebrow">PUMP.FUN · BONDING CURVE ≥ {data?.rules.minCurveProgressPct ?? 60}%</div>
+              <h2>Hampir rilis ke DEX <span>{pad2(nearGraduation.length)}</span></h2>
+              <p className="section-note">Token pump.fun yang belum "lulus" tapi bonding curve-nya hampir penuh. Diperiksa dengan syarat yang sama (harga &lt; Rp1, umur ≤24 jam, authority, wallet dev, holder, insider, media sosial); likuiditas masih di bonding curve dan pindah ke DEX saat lulus.</p>
+            </div>
+          </div>
+          <section className="candidate-list bonding-list">
+            {screening.isLoading && <div className="candidate-card skeleton" aria-hidden="true" />}
+            {nearGraduation.map(c => (
+              <CandidateCard key={c.mint} candidate={c} review={reviews[c.mint]} reviewing={reviewing[c.mint] === true} onOpen={() => setSelectedMint(c.mint)} onCopy={() => void copyMint(c.mint)} />
+            ))}
+            {data && nearGraduation.length === 0 && (
+              <div className="empty-state compact">
+                <Target size={20} />
+                <strong>Belum ada token pump.fun yang hampir lulus dan memenuhi syarat</strong>
+                <span>{data.bondingScanned} token di bonding curve dicek pada pemindaian ini.</span>
+              </div>
+            )}
           </section>
 
           <section className="lower-grid">
@@ -1083,7 +1106,7 @@ function DetailModal({ candidate, claudeReady, claudeModel, review, reviewing, r
           <div className="token-identity">
             <TokenOrb candidate={candidate} large />
             <div>
-              <div className="eyebrow">REVIEW TOKEN / LIVE · {formatAgo(candidate.ageMinutes).toUpperCase()}</div>
+              <div className="eyebrow">{candidate.curve ? `PUMP.FUN · BONDING ${Math.round(candidate.curve.progressPct)}%` : "REVIEW TOKEN / LIVE"} · {formatAgo(candidate.ageMinutes).toUpperCase()}</div>
               <h2 id="detail-title">{candidate.name} <span>{candidate.symbol}</span></h2>
             </div>
           </div>
@@ -1101,7 +1124,9 @@ function DetailModal({ candidate, claudeReady, claudeModel, review, reviewing, r
           <span className={`detail-change ${(candidate.change.h24 ?? 0) >= 0 ? "positive" : "negative"}`}>{fmtChange(candidate.change.h24)}</span>
         </div>
         <div className="detail-grid">
-          <div className="detail-stat"><span>Likuiditas</span><strong>{formatUsdShort(candidate.liquidityUsd)}</strong><small>{candidate.checks.liquidity.lpLockedPct !== null ? `LP ${Math.round(candidate.checks.liquidity.lpLockedPct)}% terkunci` : "LP tidak diketahui"}</small></div>
+          {candidate.curve
+            ? <div className="detail-stat"><span>Bonding curve</span><strong>{candidate.curve.progressPct.toLocaleString("id-ID", { maximumFractionDigits: 1 })}%</strong><small>{candidate.curve.solInCurve.toLocaleString("id-ID", { maximumFractionDigits: 1 })} SOL terkumpul</small></div>
+            : <div className="detail-stat"><span>Likuiditas</span><strong>{formatUsdShort(candidate.liquidityUsd)}</strong><small>{candidate.checks.liquidity.lpLockedPct !== null ? `LP ${Math.round(candidate.checks.liquidity.lpLockedPct)}% terkunci` : "LP tidak diketahui"}</small></div>}
           <div className="detail-stat"><span>Volume 24j</span><strong>{formatUsdShort(candidate.volume24hUsd)}</strong><small>Market cap {formatUsdShort(candidate.marketCapUsd)}</small></div>
           <div className="detail-stat"><span>Holder</span><strong>{candidate.checks.holders.totalHolders?.toLocaleString("id-ID") ?? "—"}</strong><small>{candidate.checks.holders.label}</small></div>
           <div className="detail-stat"><span>RugCheck</span><strong>{candidate.rugScore ?? "—"}/100</strong><small>Makin rendah makin aman</small></div>
@@ -1170,6 +1195,7 @@ function DetailModal({ candidate, claudeReady, claudeModel, review, reviewing, r
             <a href={candidate.links.dexscreener} target="_blank" rel="noopener noreferrer"><Globe2 size={14} /> DexScreener</a>
             <a href={candidate.links.rugcheck} target="_blank" rel="noopener noreferrer"><ShieldCheck size={14} /> RugCheck</a>
             <a href={candidate.links.solscan} target="_blank" rel="noopener noreferrer"><Database size={14} /> Solscan</a>
+            {candidate.links.pumpfun && <a href={candidate.links.pumpfun} target="_blank" rel="noopener noreferrer"><Zap size={14} /> pump.fun</a>}
           </div>
           <div className="modal-actions">
             {!review && (
@@ -1274,11 +1300,21 @@ function CandidateCard({ candidate, review, reviewing, onOpen, onCopy }: { candi
         <SignalItem label="Bubble map" value={candidate.checks.bubble.label} tone={candidate.checks.bubble.tone} />
         <SignalItem label="Media sosial" value={candidate.checks.socials.label} tone={candidate.checks.socials.tone} />
       </div>
+      {candidate.curve && (
+        <div className="curve-row" title="Progres bonding curve pump.fun">
+          <span className="curve-label">Bonding curve</span>
+          <div className="curve-bar"><span style={{ width: `${Math.min(100, candidate.curve.progressPct)}%` }} /></div>
+          <strong>{candidate.curve.progressPct.toLocaleString("id-ID", { maximumFractionDigits: 1 })}%</strong>
+          <small>{candidate.curve.solInCurve.toLocaleString("id-ID", { maximumFractionDigits: 1 })} SOL</small>
+        </div>
+      )}
       {candidate.unmet.length > 0 && (
         <div className="unmet-line"><AlertTriangle size={13} /><span><b>Belum memenuhi {candidate.unmet.length} syarat:</b> {candidate.unmet.join(" · ")}</span></div>
       )}
       <div className="candidate-bottom">
-        <div className="metric-inline"><span>Likuiditas</span><strong>{formatUsdShort(candidate.liquidityUsd)}</strong></div>
+        {candidate.curve
+          ? <div className="metric-inline"><span>Market cap</span><strong>{formatUsdShort(candidate.marketCapUsd)}</strong></div>
+          : <div className="metric-inline"><span>Likuiditas</span><strong>{formatUsdShort(candidate.liquidityUsd)}</strong></div>}
         <div className="metric-inline"><span>Volume 24j</span><strong>{formatUsdShort(candidate.volume24hUsd)}</strong></div>
         <div className="tag-list">
           {links.map(l => <a key={l.url} href={l.url} target="_blank" rel="noopener noreferrer nofollow" title={l.url}>{linkIcon(`${l.label} ${l.url}`)}</a>)}

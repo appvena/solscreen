@@ -1,3 +1,4 @@
+import type { CurveState } from "./pumpfun";
 import type { Market, Profile, RugReport } from "./sources";
 
 export type Tone = "good" | "warn" | "bad";
@@ -19,6 +20,8 @@ export const RULES = {
   rugScoreMax: 70,
   /** A token may miss at most this many (non-critical) requirements and still be listed. */
   maxUnmet: 2,
+  /** pump.fun: minimum bonding-curve progress to count as "about to graduate". */
+  minCurveProgressPct: 60,
 } as const;
 
 export type TokenCandidate = {
@@ -37,7 +40,9 @@ export type TokenCandidate = {
   description: string | null;
   websites: { label: string; url: string }[];
   socials: { label: string; url: string }[];
-  links: { dexscreener: string; rugcheck: string; solscan: string };
+  links: { dexscreener: string; rugcheck: string; solscan: string; pumpfun?: string };
+  /** Set for pump.fun tokens still on the bonding curve (not yet graduated to a DEX). */
+  curve: { progressPct: number; solInCurve: number; address: string } | null;
   checks: {
     authorities: Check;
     devWallet: Check;
@@ -88,7 +93,17 @@ export function holderStats(report: RugReport) {
   };
 }
 
-export function analyzeToken(market: Market, report: RugReport, profile: Profile | undefined, usdIdr: number, now = Date.now()): TokenCandidate {
+/** Bonding-curve tokens: same rules, except liquidity/LP (the curve holds the liquidity). */
+export function prefilterBonding(m: Market, usdIdr: number, now = Date.now()): PrefilterResult {
+  if (m.priceUsd === null || m.pairCreatedAt === null) return { ok: false, reason: "data" };
+  if (now - m.pairCreatedAt > RULES.maxAgeHours * 3600_000) return { ok: false, reason: "umur" };
+  if (m.priceUsd * usdIdr >= RULES.maxPriceIdr) return { ok: false, reason: "harga" };
+  return { ok: true };
+}
+
+export function analyzeToken(market: Market, report: RugReport, profile: Profile | undefined, usdIdr: number, now = Date.now(), curve?: CurveState): TokenCandidate {
+  // The bonding-curve account holds the unsold supply — it is not a "holder".
+  if (curve) report.ammAccounts.add(curve.address);
   const reasons: { text: string; tone: Tone }[] = [];
   const add = (tone: Tone, text: string) => reasons.push({ tone, text });
 
@@ -147,11 +162,15 @@ export function analyzeToken(market: Market, report: RugReport, profile: Profile
   const socialsCheck: Check = hasX && websites.length > 0 ? { tone: "good", label: "X + website" } : socialCount > 0 ? { tone: "warn", label: `${socialCount} tautan` } : { tone: "bad", label: "Tanpa media sosial" };
   add(socialsCheck.tone, socialCount === 0 ? "Tidak ada website atau media sosial yang terdaftar" : `Tautan proyek: ${[...websites, ...socials].map(l => l.label).join(", ")}`);
 
-  // Liquidity & LP
-  const lpLocked = report.lpLockedPct;
-  const liqTone: Tone = lpLocked !== null && lpLocked >= 90 ? "good" : lpLocked !== null && lpLocked < 50 ? "bad" : "warn";
-  const liquidity = { tone: liqTone, label: `${short(market.liquidityUsd ?? 0)}${lpLocked !== null ? ` · LP ${fmtPct(lpLocked)} terkunci` : ""}`, lpLockedPct: lpLocked };
-  add(liqTone, lpLocked === null ? "Status penguncian LP tidak diketahui" : `${fmtPct(lpLocked)} LP terkunci/terbakar`);
+  // Liquidity & LP (bonding curve: liquidity sits in the curve, managed by pump.fun)
+  const lpLocked = curve ? null : report.lpLockedPct;
+  const liqTone: Tone = curve ? "good" : lpLocked !== null && lpLocked >= 90 ? "good" : lpLocked !== null && lpLocked < 50 ? "bad" : "warn";
+  const liquidity = curve
+    ? { tone: liqTone, label: `Bonding curve ${fmtPct(curve.progressPct)} · ${curve.solInCurve.toFixed(1).replace(".", ",")} SOL`, lpLockedPct: null }
+    : { tone: liqTone, label: `${short(market.liquidityUsd ?? 0)}${lpLocked !== null ? ` · LP ${fmtPct(lpLocked)} terkunci` : ""}`, lpLockedPct: lpLocked };
+  add(liqTone, curve
+    ? `Masih di bonding curve pump.fun: ${fmtPct(curve.progressPct)} terisi (${curve.solInCurve.toFixed(1).replace(".", ",")} SOL). Likuiditas pindah ke DEX saat lulus.`
+    : lpLocked === null ? "Status penguncian LP tidak diketahui" : `${fmtPct(lpLocked)} LP terkunci/terbakar`);
 
   // RugCheck danger flags not already covered
   const dangers = report.risks.filter(r => r.level === "danger");
@@ -196,7 +215,9 @@ export function analyzeToken(market: Market, report: RugReport, profile: Profile
       dexscreener: market.url ?? `https://dexscreener.com/solana/${market.mint}`,
       rugcheck: `https://rugcheck.xyz/tokens/${market.mint}`,
       solscan: `https://solscan.io/token/${market.mint}`,
+      ...(curve ? { pumpfun: `https://pump.fun/coin/${market.mint}` } : {}),
     },
+    curve: curve ? { progressPct: curve.progressPct, solInCurve: curve.solInCurve, address: curve.address } : null,
     checks: { authorities, devWallet, holders, bubble, socials: socialsCheck, liquidity },
     rugScore: score,
     status,

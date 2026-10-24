@@ -3,6 +3,7 @@ import { createMemoryKv, setKvForTests } from "../kv";
 import { analyzeToken, prefilter, sparkFromChanges } from "./analyze";
 import { runScreening, type ScreeningDeps } from "./index";
 import { parseDexPairs, parseDexProfiles, parseGeckoNewPools, parseRugReport, type Market } from "./sources";
+import { bondingCurveAddress, INITIAL_REAL_TOKEN_RESERVES, parseBondingCurve } from "./pumpfun";
 
 const NOW = Date.parse("2026-10-24T12:00:00Z");
 const RATE = 16_000;
@@ -128,6 +129,8 @@ describe("screening pipeline", () => {
       now: () => NOW,
       usdIdr: async () => ({ rate: RATE, live: true }),
       geckoPools: async () => [{ mint: MINT_B, poolAddress: "P", createdAt: NOW - 600_000, dex: "raydium" }],
+      geckoPumpPools: async () => [],
+      curves: async () => [],
       dexProfiles: async () => [{ mint: MINT_A, description: "Proyek A", links: [], icon: null }],
       dexMarkets: async mints => {
         expect(new Set(mints)).toEqual(new Set([MINT_A, MINT_B]));
@@ -150,6 +153,8 @@ describe("screening pipeline", () => {
       now: () => NOW,
       usdIdr: async () => ({ rate: RATE, live: false }),
       geckoPools: async () => { throw new Error("HTTP 429"); },
+      geckoPumpPools: async () => [],
+      curves: async () => [],
       dexProfiles: async () => [{ mint: MINT_C, description: null, links: [], icon: null }],
       dexMarkets: async () => parseDexPairs([pair(MINT_C)]),
       rugReport: async () => { throw new Error("timeout"); },
@@ -158,5 +163,61 @@ describe("screening pipeline", () => {
     expect(result.sources.find(s => s.name.startsWith("GeckoTerminal"))).toMatchObject({ ok: false, error: "HTTP 429" });
     expect(result.sources.find(s => s.name.startsWith("RugCheck"))).toMatchObject({ ok: false });
     expect(result.candidates).toEqual([]);
+  });
+});
+
+describe("pump.fun about to graduate", () => {
+  const curveBuf = (realToken: bigint, realSol: bigint, complete: boolean) => {
+    const b = Buffer.alloc(8 + 8 * 5 + 1);
+    b.writeBigUInt64LE(realToken, 8 + 16);
+    b.writeBigUInt64LE(realSol, 8 + 24);
+    b.writeUInt8(complete ? 1 : 0, 8 + 40);
+    return b;
+  };
+
+  it("derives the bonding-curve address and reads progress from account data", () => {
+    expect(bondingCurveAddress("DKYcjobF7HPtL9RyQBRdeRQ2iWvizpfbgWwPWNXdpump")).toBe("7auPqL9zzUx1uMsY8SMBW4oMsZpJ3Q98P9JYCALfemTR");
+    expect(bondingCurveAddress("not-a-key")).toBeNull();
+    const quarterLeft = INITIAL_REAL_TOKEN_RESERVES / 4n;
+    const c = parseBondingCurve("m", "a", curveBuf(quarterLeft, 60_500_000_000n, false))!;
+    expect(c).toMatchObject({ progressPct: 75, solInCurve: 60.5, complete: false });
+    expect(parseBondingCurve("m", "a", curveBuf(0n, 85_000_000_000n, true))!.progressPct).toBe(100);
+    expect(parseBondingCurve("m", "a", Buffer.alloc(10))).toBeNull();
+  });
+
+  it("lists bonding-curve tokens ≥60% with the same rules, excluding the curve from holders", async () => {
+    setKvForTests(createMemoryKv());
+    const MINT_P = "DKYcjobF7HPtL9RyQBRdeRQ2iWvizpfbgWwPWNXdpump";
+    const MINT_Q = "Gq9ttttttttttttttttttttttttttttttttttttpump";
+    const MINT_R = "Rr9rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrpump";
+    const curveAddr = bondingCurveAddress(MINT_P)!;
+    const bondingPair = (mint: string) => pair(mint, { dexId: "pumpfun", liquidity: undefined, priceUsd: "0.000006" });
+    const deps: ScreeningDeps = {
+      now: () => NOW,
+      usdIdr: async () => ({ rate: RATE, live: true }),
+      geckoPools: async () => [],
+      geckoPumpPools: async () => [MINT_P, MINT_Q, MINT_R].map(mint => ({ mint, poolAddress: null, createdAt: NOW - 3600_000, dex: "pump-fun" })),
+      dexProfiles: async () => [],
+      dexMarkets: async () => parseDexPairs([bondingPair(MINT_P), bondingPair(MINT_Q), bondingPair(MINT_R)]),
+      curves: async () => [
+        { mint: MINT_P, address: curveAddr, progressPct: 83.4, solInCurve: 71.2, complete: false },
+        { mint: MINT_Q, address: "x", progressPct: 35, solInCurve: 20, complete: false }, // too early
+        { mint: MINT_R, address: "y", progressPct: 100, solInCurve: 85, complete: true }, // already graduated
+      ],
+      rugReport: async mint => parseRugReport(mint, healthyReport(mint, {
+        topHolders: [{ address: curveAddr, owner: "PumpProgram", pct: 70, insider: false }, ...Array.from({ length: 10 }, (_, i) => ({ address: `H${i}`, owner: `O${i}`, pct: 1.5 }))],
+        markets: [],
+      })),
+    };
+    const result = await runScreening(deps);
+    expect(result.candidates).toEqual([]);
+    expect(result.nearGraduation.map(c => c.mint)).toEqual([MINT_P]);
+    const c = result.nearGraduation[0];
+    expect(c.curve).toMatchObject({ progressPct: 83.4, solInCurve: 71.2 });
+    expect(c.checks.holders.top10Pct).toBe(15); // bonding-curve account not counted
+    expect(c.checks.liquidity.tone).toBe("good");
+    expect(c.status).toBe("Lolos");
+    expect(c.links.pumpfun).toBe(`https://pump.fun/coin/${MINT_P}`);
+    expect(result.sources.find(s => s.name.startsWith("Solana RPC"))).toMatchObject({ ok: true, count: 3 });
   });
 });

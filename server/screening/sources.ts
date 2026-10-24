@@ -63,6 +63,20 @@ export async function fetchGeckoNewPools(pages = 3): Promise<NewPool[]> {
   return ok.flatMap(r => parseGeckoNewPools(r.value));
 }
 
+/** Most active pump.fun pools on GeckoTerminal (bonding-curve tokens). */
+export async function fetchGeckoPumpPools(pages = 2): Promise<NewPool[]> {
+  const results = await Promise.allSettled(
+    Array.from({ length: pages }, (_, i) =>
+      getJson(`https://api.geckoterminal.com/api/v2/networks/solana/dexes/pump-fun/pools?page=${i + 1}&sort=h24_tx_count_desc`, 9000, { Accept: "application/json;version=20230302" }),
+    ),
+  );
+  const ok = results.filter((r): r is PromiseFulfilledResult<unknown> => r.status === "fulfilled");
+  if (ok.length === 0) throw (results[0] as PromiseRejectedResult).reason;
+  return ok.flatMap(r => parseGeckoNewPools(r.value));
+}
+
+export const isBondingDex = (dex: string | null) => !!dex && /pump/i.test(dex) && !/swap|amm/i.test(dex);
+
 // --- DexScreener: latest token profiles & boosts (tokens with socials) -----
 export type Profile = { mint: string; description: string | null; links: { label: string; url: string }[]; icon: string | null };
 

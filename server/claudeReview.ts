@@ -93,6 +93,7 @@ export function candidateForPrompt(c: TokenCandidate) {
     marketCapUsd: c.marketCapUsd,
     dex: c.dexId,
     statusAturan: c.status,
+    bondingCurvePumpFun: c.curve ? { progresPersen: c.curve.progressPct, solDiCurve: c.curve.solInCurve, catatan: "Belum lulus ke DEX; likuiditas masih di bonding curve pump.fun" } : null,
     syaratTidakTerpenuhi: c.unmet,
     rugcheckScore0sd100: c.rugScore,
     cek: Object.fromEntries(Object.entries(c.checks).map(([k, v]) => [k, `${v.tone}: ${v.label}`])),

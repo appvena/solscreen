@@ -27,8 +27,16 @@ export type ScreeningResult = {
   rules: typeof RULES;
 };
 
-const CACHE_KEY = "solscreen:screening:v1";
-const CACHE_SECONDS = 15 * 60;
+const CACHE_KEY = "solscreen:screening:v2";
+const LOG_KEY = "solscreen:screening:log";
+export const SCAN_CACHE_MINUTES = 15;
+
+export type ScanLogEntry = { at: string; scanned: number; lolos: number; pantau: number; ditolak: number; sourcesOk: number; sourcesTotal: number; trigger: "buka" | "manual" | "jadwal" };
+
+export async function getScanLog(): Promise<ScanLogEntry[]> {
+  return (await getKv().get<ScanLogEntry[]>(LOG_KEY).catch(() => null)) ?? [];
+}
+const CACHE_SECONDS = SCAN_CACHE_MINUTES * 60;
 const MAX_RUGCHECK = 18;
 
 export type ScreeningDeps = {
@@ -96,7 +104,9 @@ export async function runScreening(deps: ScreeningDeps = defaultDeps): Promise<S
   });
 
   const order = { Lolos: 0, Pantau: 1, Ditolak: 2 } as const;
-  analyzed.sort((a, b) => order[a.status] - order[b.status] || (b.liquidityUsd ?? 0) - (a.liquidityUsd ?? 0));
+  const riskOrder = { Low: 0, Medium: 1, High: 2 } as const;
+  analyzed.sort((a, b) =>
+    order[a.status] - order[b.status] || riskOrder[a.risk] - riskOrder[b.risk] || a.unmet.length - b.unmet.length || (b.liquidityUsd ?? 0) - (a.liquidityUsd ?? 0));
   const candidates = analyzed.filter(c => c.status !== "Ditolak");
   const rejectedList = analyzed.filter(c => c.status === "Ditolak");
 
@@ -108,7 +118,7 @@ export async function runScreening(deps: ScreeningDeps = defaultDeps): Promise<S
     prefilterRejected,
     checked: analyzed.length,
     candidates,
-    rejected: rejectedList.map(c => ({ symbol: c.symbol, mint: c.mint, reason: c.reasons.find(r => r.tone === "bad")?.text ?? "Risiko tinggi" })),
+    rejected: rejectedList.map(c => ({ symbol: c.symbol, mint: c.mint, reason: c.critical ?? `Tidak memenuhi ${c.unmet.length} syarat: ${c.unmet.join(", ")}` })),
     rejectedCount: rejectedList.length + Object.values(prefilterRejected).reduce((a, b) => a + b, 0),
     sources,
     rules: RULES,
@@ -117,12 +127,14 @@ export async function runScreening(deps: ScreeningDeps = defaultDeps): Promise<S
 
 let inflight: Promise<ScreeningResult> | null = null;
 
+const nextScan = (generatedAt: string) => new Date(Date.parse(generatedAt) + CACHE_SECONDS * 1000).toISOString();
+
 /** Cached screening (15 min). `force` bypasses the cache (manual refresh). */
-export async function getScreening(force = false): Promise<ScreeningResult & { cached: boolean }> {
+export async function getScreening(force = false, trigger: ScanLogEntry["trigger"] = force ? "manual" : "buka"): Promise<ScreeningResult & { cached: boolean; nextScanAt: string }> {
   const kv = getKv();
   if (!force) {
     const hit = await kv.get<ScreeningResult>(CACHE_KEY).catch(() => null);
-    if (hit) return { ...hit, cached: true };
+    if (hit) return { ...hit, cached: true, nextScanAt: nextScan(hit.generatedAt) };
   }
   if (!inflight) {
     inflight = runScreening().finally(() => { inflight = null; });
@@ -130,5 +142,17 @@ export async function getScreening(force = false): Promise<ScreeningResult & { c
   const fresh = await inflight;
   // Don't cache a run where every source failed.
   if (fresh.sources.some(s => s.ok && s.count > 0)) await kv.set(CACHE_KEY, fresh, CACHE_SECONDS).catch(() => undefined);
-  return { ...fresh, cached: false };
+  const entry: ScanLogEntry = {
+    at: fresh.generatedAt,
+    scanned: fresh.scanned,
+    lolos: fresh.candidates.filter(c => c.status === "Lolos").length,
+    pantau: fresh.candidates.filter(c => c.status === "Pantau").length,
+    ditolak: fresh.rejectedCount,
+    sourcesOk: fresh.sources.filter(s => s.ok).length,
+    sourcesTotal: fresh.sources.length,
+    trigger,
+  };
+  const log = await getScanLog();
+  if (log[0]?.at !== entry.at) await kv.set(LOG_KEY, [entry, ...log].slice(0, 30)).catch(() => undefined);
+  return { ...fresh, cached: false, nextScanAt: nextScan(fresh.generatedAt) };
 }

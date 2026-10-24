@@ -26,7 +26,7 @@ import {
   reviewCandidate,
 } from "./claudeReview";
 import { getKv } from "./kv";
-import { getScreening } from "./screening";
+import { getScanLog, getScreening } from "./screening";
 import { getUsageSummary, setBalance, takeDailyReviewSlot } from "./usage";
 
 export const appRouter = router({
@@ -109,6 +109,7 @@ export const appRouter = router({
           throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Gagal mengambil data token. Coba muat ulang sebentar lagi." });
         }
       }),
+    history: appProcedure.query(() => getScanLog()),
   }),
 
   ai: router({

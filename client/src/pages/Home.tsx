@@ -52,6 +52,9 @@ const dateFmt = new Intl.DateTimeFormat("id-ID", { day: "2-digit", month: "short
 const timeFmt = new Intl.DateTimeFormat("id-ID", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 
 const formatClock = (date: Date) => timeFmt.format(date).replace(/\./g, ":");
+const zoneFmt = new Intl.DateTimeFormat("id-ID", { timeZoneName: "short" });
+const zoneLabel = () => zoneFmt.formatToParts(new Date()).find(p => p.type === "timeZoneName")?.value ?? "";
+const formatHm = (date: Date) => formatClock(date).slice(0, 5);
 const formatAgo = (minutes: number) => {
   if (minutes < 1) return "baru saja";
   if (minutes < 60) return `${minutes} mnt lalu`;
@@ -107,14 +110,14 @@ const RISK_LABEL: Record<Candidate["risk"], string> = { Low: "Risiko rendah", Me
 type AlertSettings = {
   thresholds: number[];
   downThreshold: number;
-  frequencyMinutes: 1 | 5 | 15;
+  frequencyMinutes: 15 | 30 | 60;
   push: boolean;
   autoReview: boolean;
 };
 
 const SETTINGS_KEY = "solscreen.alertSettings.v1";
 const PRESET_THRESHOLDS = [10, 20, 30];
-const DEFAULT_SETTINGS: AlertSettings = { thresholds: [10, 20, 30], downThreshold: 10, frequencyMinutes: 5, push: false, autoReview: true };
+const DEFAULT_SETTINGS: AlertSettings = { thresholds: [10, 20, 30], downThreshold: 10, frequencyMinutes: 15, push: false, autoReview: true };
 
 function loadSettings(): AlertSettings {
   try {
@@ -127,7 +130,7 @@ function loadSettings(): AlertSettings {
     return {
       thresholds: [...new Set(thresholds)].sort((a, b) => a - b),
       downThreshold: Number.isInteger(parsed.downThreshold) && parsed.downThreshold! >= 1 && parsed.downThreshold! <= 50 ? parsed.downThreshold! : DEFAULT_SETTINGS.downThreshold,
-      frequencyMinutes: parsed.frequencyMinutes === 1 || parsed.frequencyMinutes === 15 ? parsed.frequencyMinutes : 5,
+      frequencyMinutes: parsed.frequencyMinutes === 30 || parsed.frequencyMinutes === 60 ? parsed.frequencyMinutes : 15,
       push: parsed.push === true,
       autoReview: parsed.autoReview !== false,
     };
@@ -296,10 +299,13 @@ export default function Home() {
   const screening = trpc.screening.today.useQuery(undefined, {
     refetchOnWindowFocus: false,
     staleTime: 5 * 60_000,
-    refetchInterval: Math.max(settings.frequencyMinutes, 5) * 60_000,
+    refetchInterval: settings.frequencyMinutes * 60_000,
     retry: 1,
   });
   const data = screening.data;
+  const history = trpc.screening.history.useQuery(undefined, { refetchOnWindowFocus: false });
+  useEffect(() => { if (data) void history.refetch(); }, [data?.generatedAt]); // eslint-disable-line react-hooks/exhaustive-deps
+  const nextScanAt = data ? new Date(Math.max(Date.parse(data.nextScanAt), Date.parse(data.generatedAt) + settings.frequencyMinutes * 60_000)) : null;
   const candidates = useMemo(() => data?.candidates ?? [], [data]);
   const lastSync = data ? new Date(data.generatedAt) : null;
 
@@ -387,7 +393,8 @@ export default function Home() {
     try {
       const fresh = await utils.screening.today.fetch({ force: true });
       utils.screening.today.setData(undefined, fresh);
-      notify(`Data diperbarui · ${fresh.candidates.length} kandidat`);
+      notify(`Dipindai ${formatClock(new Date(fresh.generatedAt))} · ${fresh.candidates.length} kandidat`);
+      void history.refetch();
     } catch (error) {
       notify(error instanceof Error ? error.message : "Gagal memuat ulang");
     } finally {
@@ -510,6 +517,15 @@ export default function Home() {
             </div>
           </section>
 
+          <section className="scan-strip" aria-label="Waktu pemindaian">
+            <div><span className="eyebrow">TERAKHIR DIPINDAI</span><strong>{lastSync ? `${formatClock(lastSync)} ${zoneLabel()}` : screening.isLoading ? "memindai…" : "—"}</strong></div>
+            <div><span className="eyebrow">BERIKUTNYA</span><strong>{nextScanAt ? `± ${formatHm(nextScanAt)} ${zoneLabel()}` : "—"}</strong><small>saat aplikasi terbuka</small></div>
+            <div><span className="eyebrow">HASIL</span><strong>{data ? `${counts.lolos} lolos · ${counts.pantau} pantau` : "—"}</strong></div>
+            <button type="button" className="primary-button" onClick={() => void refresh()} disabled={refreshing || screening.isFetching}>
+              <RefreshCw size={14} className={refreshing || screening.isFetching ? "spin" : ""} /> {refreshing ? "Memindai…" : "Pindai sekarang"}
+            </button>
+          </section>
+
           {usingDefaultPassword && (
             <section className="password-banner" role="alert">
               <KeyRound size={16} />
@@ -538,7 +554,7 @@ export default function Home() {
           <section className="metrics-grid" aria-label="Ringkasan screening">
             <Metric label="Token baru dipindai" value={data ? String(data.scanned) : "…"} detail={data ? `${data.checked} dicek mendalam` : "memindai"} icon={<Activity size={16} />} tone="lime" />
             <Metric label="Lolos semua syarat" value={data ? pad2(counts.lolos) : "…"} detail="dev, holder, insider, sosial sehat" icon={<ShieldCheck size={16} />} tone="blue" />
-            <Metric label="Perlu dipantau" value={data ? pad2(counts.pantau) : "…"} detail={`${unreadAlerts} alert belum dibaca`} icon={<CircleHelp size={16} />} tone="amber" />
+            <Metric label="Perlu dipantau" value={data ? pad2(counts.pantau) : "…"} detail="kurang 1–2 syarat" icon={<CircleHelp size={16} />} tone="amber" />
             <Metric label="Ditolak / risiko tinggi" value={data ? String(data.rejectedCount) : "…"} detail={data ? `harga ≥Rp1: ${data.prefilterRejected.harga} · umur >24j: ${data.prefilterRejected.umur}` : "—"} icon={<AlertTriangle size={16} />} tone="coral" />
           </section>
 
@@ -595,6 +611,7 @@ export default function Home() {
                 <div className="rule-line"><span>Top 10 holder</span><strong>≤ {data?.rules.top10HealthyPct ?? 30}%</strong></div>
                 <div className="rule-line"><span>Saldo wallet dev</span><strong>≤ {data?.rules.creatorHealthyPct ?? 3}%</strong></div>
                 <div className="rule-line"><span>Cluster insider</span><strong>0</strong></div>
+                <div className="rule-line"><span>Boleh kurang</span><strong>maks. {data?.rules.maxUnmet ?? 2} syarat</strong></div>
                 <div className="rule-line"><span>Ambang alert</span><strong>{settings.thresholds.length ? `+${settings.thresholds.join("/+")}%` : "off"} · −{settings.downThreshold}%</strong></div>
                 <button type="button" className="outline-button" onClick={() => setSettingsOpen(true)}>Ubah ambang alert <Settings2 size={14} /></button>
               </div>
@@ -622,6 +639,25 @@ export default function Home() {
                 ))}
               </div>
             </div>
+            <div className="panel history-panel">
+              <div className="panel-heading"><div><div className="eyebrow">RIWAYAT</div><h2>Jam pemindaian</h2></div><Clock3 size={18} className="panel-icon" /></div>
+              {(history.data ?? []).length === 0 && <p className="integration-copy">Belum ada riwayat. Pemindaian tercatat setiap kali data diperbarui.</p>}
+              <div className="history-list">
+                {(history.data ?? []).slice(0, 12).map(h => (
+                  <div key={h.at} className="history-row">
+                    <strong>{formatClock(new Date(h.at))}</strong>
+                    <span className="history-date">{dateFmt.format(new Date(h.at))}</span>
+                    <span className="history-trigger">{h.trigger === "manual" ? "manual" : h.trigger === "jadwal" ? "jadwal" : "buka app"}</span>
+                    <span className="history-counts"><b className="positive">{h.lolos}</b> lolos · <b>{h.pantau}</b> pantau · {h.ditolak} tolak</span>
+                    {h.sourcesOk < h.sourcesTotal && <span className="history-warn" title="Ada sumber data yang gagal"><AlertTriangle size={12} /></span>}
+                  </div>
+                ))}
+              </div>
+              <p className="integration-copy">Saat ini pemindaian berjalan ketika aplikasi dibuka, otomatis tiap {settings.frequencyMinutes} menit selama aplikasi terbuka, atau saat Anda menekan "Pindai sekarang". Zona waktu: {zoneLabel()}.</p>
+            </div>
+          </section>
+
+          <section className="lower-grid single">
             <div className="panel integration-panel">
               <div className="panel-heading"><div><div className="eyebrow">CARA KERJA</div><h2>Alur screening</h2></div><Zap size={18} className="panel-icon" /></div>
               <div className="integration-flow">
@@ -631,7 +667,7 @@ export default function Home() {
                 <div className="flow-line" />
                 <FlowNode label="Claude" status={claudeReady ? `${Object.keys(reviews).length} direview` : "Belum diatur"} tone={claudeReady ? "good" : "blue"} />
               </div>
-              <p className="integration-copy">Setiap pemindaian mengambil token Solana terbaru, membuang yang berumur &gt;24 jam, berharga ≥Rp1, atau likuiditasnya tipis, lalu memeriksa authority, wallet dev, distribusi holder, jaringan insider (pengganti bubble map), dan LP lewat RugCheck. Kandidat yang tersisa ditinjau Claude, termasuk riset media sosial dan rencana proyek di web. Hasil review disimpan 24 jam agar kredit tidak terbuang.</p>
+              <p className="integration-copy">Setiap pemindaian mengambil token Solana terbaru, membuang yang berumur &gt;24 jam, berharga ≥Rp1, atau likuiditasnya tipis, lalu memeriksa authority, wallet dev, distribusi holder, jaringan insider (pengganti bubble map), dan LP lewat RugCheck. Token yang hanya kurang 1–2 syarat tetap ditampilkan sebagai "Pantau" dengan keterangan syarat yang belum terpenuhi; authority aktif atau token yang sudah di-rug selalu ditolak. Kandidat ditinjau Claude, termasuk riset media sosial dan rencana proyek di web. Hasil review disimpan 24 jam agar kredit tidak terbuang.</p>
             </div>
           </section>
           <footer className="footer-note"><span><Zap size={13} /> Dibuat untuk pemantauan berbasis bukti</span><span>Harga dan status hanya valid pada waktu pemindaian. Bukan saran investasi.</span></footer>
@@ -818,9 +854,9 @@ function SettingsDrawer({ initial, onClose, onSave, notify, focusSecurity, minPa
         </div>
 
         <div className="setting-group">
-          <div className="setting-label">Frekuensi pengecekan</div>
+          <div className="setting-label">Pindai ulang otomatis (saat aplikasi terbuka)</div>
           <div className="frequency-grid">
-            {([1, 5, 15] as const).map(item => (
+            {([15, 30, 60] as const).map(item => (
               <button type="button" key={item} aria-pressed={draft.frequencyMinutes === item} className={`frequency-option ${draft.frequencyMinutes === item ? "selected" : ""}`} onClick={() => setDraft(d => ({ ...d, frequencyMinutes: item }))}>
                 {item} menit{draft.frequencyMinutes === item && <Check size={14} />}
               </button>
@@ -999,6 +1035,15 @@ function DetailModal({ candidate, claudeReady, claudeModel, review, reviewing, r
           <div className="detail-stat"><span>RugCheck</span><strong>{candidate.rugScore ?? "—"}/100</strong><small>Makin rendah makin aman</small></div>
         </div>
 
+        <div className={`terms-box ${candidate.unmet.length ? "warn" : "good"}`}>
+          <div className="eyebrow">KETENTUAN</div>
+          {candidate.unmet.length === 0
+            ? <p><Check size={13} /> Memenuhi semua syarat screening.</p>
+            : <>
+                <p>Ditampilkan sebagai <b>Pantau</b> karena belum memenuhi {candidate.unmet.length} dari syarat berikut (maksimal 2 boleh kurang):</p>
+                <ul>{candidate.unmet.map(u => <li key={u}><SignalDot tone="warn" /> {u}</li>)}</ul>
+              </>}
+        </div>
         <div className="check-grid">
           {CHECK_LABELS.map(([key, label]) => (
             <div key={key} className={`check-item ${candidate.checks[key].tone}`}><SignalDot tone={candidate.checks[key].tone} /><div><span>{label}</span><strong>{candidate.checks[key].label}</strong></div></div>
@@ -1157,6 +1202,9 @@ function CandidateCard({ candidate, review, reviewing, onOpen, onCopy }: { candi
         <SignalItem label="Bubble map" value={candidate.checks.bubble.label} tone={candidate.checks.bubble.tone} />
         <SignalItem label="Media sosial" value={candidate.checks.socials.label} tone={candidate.checks.socials.tone} />
       </div>
+      {candidate.unmet.length > 0 && (
+        <div className="unmet-line"><AlertTriangle size={13} /><span><b>Belum memenuhi {candidate.unmet.length} syarat:</b> {candidate.unmet.join(" · ")}</span></div>
+      )}
       <div className="candidate-bottom">
         <div className="metric-inline"><span>Likuiditas</span><strong>{formatUsdShort(candidate.liquidityUsd)}</strong></div>
         <div className="metric-inline"><span>Volume 24j</span><strong>{formatUsdShort(candidate.volume24hUsd)}</strong></div>

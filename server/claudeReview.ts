@@ -93,6 +93,7 @@ export function candidateForPrompt(c: TokenCandidate) {
     marketCapUsd: c.marketCapUsd,
     dex: c.dexId,
     statusAturan: c.status,
+    syaratTidakTerpenuhi: c.unmet,
     rugcheckScore0sd100: c.rugScore,
     cek: Object.fromEntries(Object.entries(c.checks).map(([k, v]) => [k, `${v.tone}: ${v.label}`])),
     alasan: c.reasons.map(r => `${r.tone}: ${r.text}`),

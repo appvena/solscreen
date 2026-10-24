@@ -20,7 +20,7 @@ const candidate: TokenCandidate = {
     bubble: { tone: "good", label: "Tidak ada cluster insider" }, socials: { tone: "good", label: "X + website" },
     liquidity: { tone: "good", label: "$25K", lpLockedPct: 100 },
   },
-  rugScore: 12, status: "Lolos", risk: "Low", reasons: [{ tone: "good", text: "Authority off" }], spark: [1, 2],
+  rugScore: 12, status: "Lolos", unmet: [], critical: null, risk: "Low", reasons: [{ tone: "good", text: "Authority off" }], spark: [1, 2],
 };
 
 const review = {

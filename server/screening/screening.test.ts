@@ -87,21 +87,33 @@ describe("analysis rules", () => {
     expect(c.ageMinutes).toBe(180);
   });
 
-  it("rejects active mint authority, big dev wallet, insider clusters", () => {
+  it("always rejects active mint/freeze authority (critical)", () => {
     const mintAuth = analyzeToken(market(), parseRugReport(MINT_A, healthyReport(MINT_A, { token: { mintAuthority: "X", freezeAuthority: null, supply: 1e9 } })), undefined, RATE, NOW);
     expect(mintAuth.status).toBe("Ditolak");
+    expect(mintAuth.critical).toMatch(/Mint authority/);
+  });
+
+  it("lists a token missing 1–2 requirements as Pantau and names them", () => {
     const dev = analyzeToken(market(), parseRugReport(MINT_A, healthyReport(MINT_A, { creatorBalance: 200_000_000 })), undefined, RATE, NOW);
     expect(dev.checks.devWallet.tone).toBe("bad");
-    expect(dev.status).toBe("Ditolak");
-    const insiders = analyzeToken(market(), parseRugReport(MINT_A, healthyReport(MINT_A, { graphInsidersDetected: 14, insiderNetworks: [{ id: 1 }] })), undefined, RATE, NOW);
-    expect(insiders.checks.bubble.tone).toBe("bad");
-    expect(insiders.status).toBe("Ditolak");
+    expect(dev.status).toBe("Pantau");
+    expect(dev.unmet).toEqual(["Wallet dev (dev pegang 20%)"]);
+    const two = analyzeToken(market({ info: {} }), parseRugReport(MINT_A, healthyReport(MINT_A, { graphInsidersDetected: 14, insiderNetworks: [{ id: 1 }] })), undefined, RATE, NOW);
+    expect(two.status).toBe("Pantau");
+    expect(two.unmet).toHaveLength(2);
+  });
+
+  it("rejects a token missing more than 2 requirements", () => {
+    const three = analyzeToken(market({ info: {} }), parseRugReport(MINT_A, healthyReport(MINT_A, { creatorBalance: 200_000_000, graphInsidersDetected: 14, insiderNetworks: [{ id: 1 }] })), undefined, RATE, NOW);
+    expect(three.status).toBe("Ditolak");
+    expect(three.unmet).toHaveLength(3);
   });
 
   it("puts a token without socials on watch instead of passing it", () => {
     const c = analyzeToken(market({ info: {} }), parseRugReport(MINT_A, healthyReport(MINT_A)), undefined, RATE, NOW);
     expect(c.checks.socials.tone).toBe("bad");
     expect(c.status).toBe("Pantau");
+    expect(c.unmet).toEqual(["Media sosial (tanpa media sosial)"]);
   });
 
   it("builds a price path from change windows", () => {
@@ -129,6 +141,8 @@ describe("screening pipeline", () => {
     expect(result.candidates.map(c => c.mint)).toEqual([MINT_A]);
     expect(result.candidates[0].description).toBe("Proyek A");
     expect(result.sources.every(s => s.ok)).toBe(true);
+    const cached = await (await import("./index")).getScreening(false);
+    expect(cached.nextScanAt).toBeDefined();
   });
 
   it("keeps working and reports which source failed", async () => {

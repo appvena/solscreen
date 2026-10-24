@@ -17,6 +17,8 @@ export const RULES = {
   creatorMaxPct: 10,
   rugScoreWarn: 40,
   rugScoreMax: 70,
+  /** A token may miss at most this many (non-critical) requirements and still be listed. */
+  maxUnmet: 2,
 } as const;
 
 export type TokenCandidate = {
@@ -46,6 +48,10 @@ export type TokenCandidate = {
   };
   rugScore: number | null;
   status: Status;
+  /** Requirements this token does not (fully) meet, in plain language. */
+  unmet: string[];
+  /** Why it is rejected outright (authority active / rugged), if so. */
+  critical: string | null;
   risk: "Low" | "Medium" | "High";
   reasons: { text: string; tone: Tone }[];
   spark: number[];
@@ -154,10 +160,20 @@ export function analyzeToken(market: Market, report: RugReport, profile: Profile
   const score = report.scoreNormalised;
   const scoreTone: Tone = score === null ? "warn" : score >= RULES.rugScoreMax ? "bad" : score >= RULES.rugScoreWarn ? "warn" : "good";
 
-  // Decision
-  const hard = [authorities.tone, devWallet.tone, holdersTone, bubble.tone, liqTone, scoreTone].includes("bad") || dangers.length > 0 || report.rugged;
-  const soft = [devWallet.tone, holdersTone, socialsCheck.tone, liqTone, scoreTone].some(t => t !== "good");
-  const status: Status = hard ? "Ditolak" : soft ? "Pantau" : "Lolos";
+  // Decision: authority/rugged are critical (always rejected). Other requirements
+  // may be missed 1–2 times — the token is then listed as "Pantau" with the unmet ones named.
+  const critical = report.rugged ? "Ditandai sudah di-rug oleh RugCheck"
+    : report.mintAuthority ? "Mint authority masih aktif (creator bisa mencetak token)"
+    : report.freezeAuthority ? "Freeze authority masih aktif (creator bisa membekukan wallet)"
+    : null;
+  const unmet: string[] = [];
+  if (devWallet.tone !== "good") unmet.push(`Wallet dev (${devWallet.label.toLowerCase()})`);
+  if (holdersTone !== "good") unmet.push(`Distribusi holder (${holders.label})`);
+  if (bubble.tone !== "good") unmet.push(`Bubble map (${bubble.label.toLowerCase()})`);
+  if (liqTone !== "good") unmet.push(lpLocked === null ? "LP terkunci (tidak diketahui)" : `LP terkunci (${fmtPct(lpLocked)})`);
+  if (socialsCheck.tone !== "good") unmet.push(`Media sosial (${socialsCheck.label.toLowerCase()})`);
+  if (scoreTone !== "good" || dangers.length > 0) unmet.push(dangers.length ? `Peringatan RugCheck (${dangers[0].name})` : `Skor RugCheck (${score ?? "?"}/100)`);
+  const status: Status = critical || unmet.length > RULES.maxUnmet ? "Ditolak" : unmet.length > 0 ? "Pantau" : "Lolos";
 
   const price = market.priceUsd ?? 0;
   return {
@@ -184,7 +200,9 @@ export function analyzeToken(market: Market, report: RugReport, profile: Profile
     checks: { authorities, devWallet, holders, bubble, socials: socialsCheck, liquidity },
     rugScore: score,
     status,
-    risk: status === "Ditolak" ? "High" : status === "Pantau" ? "Medium" : "Low",
+    unmet,
+    critical,
+    risk: status === "Ditolak" || unmet.some(u => /^(Wallet dev|Bubble map|Peringatan)/.test(u)) ? "High" : status === "Pantau" ? "Medium" : "Low",
     reasons,
     spark: sparkFromChanges(price, market.change),
   };

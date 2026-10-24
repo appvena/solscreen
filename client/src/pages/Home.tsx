@@ -395,8 +395,10 @@ export default function Home() {
           {usingDefaultPassword && (
             <section className="password-banner" role="alert">
               <KeyRound size={16} />
-              <span><strong>Password masih bawaan.</strong> Siapa pun yang tahu password awal bisa masuk. Ganti sekarang supaya API key Claude Anda aman.</span>
-              <button type="button" className="primary-button" onClick={() => { setSecurityFocus(true); setSettingsOpen(true); }}>Ganti password</button>
+              <span><strong>Password masih bawaan (123456).</strong> Siapa pun yang tahu password awal bisa masuk. Ganti sekarang supaya API key Claude Anda aman.</span>
+              <button type="button" className="primary-button" onClick={() => { setSecurityFocus(true); setSettingsOpen(true); }}>
+                {session.data?.passwordManagedBy === "env" ? "Cara ganti password" : "Ganti password"}
+              </button>
             </section>
           )}
 
@@ -532,6 +534,7 @@ export default function Home() {
           focusSecurity={securityFocus}
           minPasswordLength={session.data?.minPasswordLength ?? 8}
           passwordPersistent={session.data?.passwordPersistent !== false}
+          passwordManagedBy={session.data?.passwordManagedBy ?? "app"}
           onLogout={() => logout.mutate()}
         />
       )}
@@ -558,7 +561,7 @@ export default function Home() {
 // ---------------------------------------------------------------------------
 // Settings drawer — edits a draft; only "Simpan" applies and persists it.
 // ---------------------------------------------------------------------------
-function SettingsDrawer({ initial, onClose, onSave, notify, focusSecurity, minPasswordLength, passwordPersistent, onLogout }: {
+function SettingsDrawer({ initial, onClose, onSave, notify, focusSecurity, minPasswordLength, passwordPersistent, passwordManagedBy, onLogout }: {
   initial: AlertSettings;
   onClose: () => void;
   onSave: (settings: AlertSettings) => void;
@@ -566,6 +569,7 @@ function SettingsDrawer({ initial, onClose, onSave, notify, focusSecurity, minPa
   focusSecurity: boolean;
   minPasswordLength: number;
   passwordPersistent: boolean;
+  passwordManagedBy: "env" | "app";
   onLogout: () => void;
 }) {
   const [draft, setDraft] = useState<AlertSettings>(initial);
@@ -675,8 +679,34 @@ function SettingsDrawer({ initial, onClose, onSave, notify, focusSecurity, minPa
           </div>
         </div>
 
-        <SecuritySection focus={focusSecurity} minLength={minPasswordLength} persistent={passwordPersistent} notify={notify} onLogout={onLogout} />
+        {passwordManagedBy === "env"
+          ? <EnvPasswordHelp focus={focusSecurity} onLogout={onLogout} />
+          : <SecuritySection focus={focusSecurity} minLength={minPasswordLength} persistent={passwordPersistent} notify={notify} onLogout={onLogout} />}
       </aside>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Password managed by the hosting dashboard (APP_PASSWORD).
+// ---------------------------------------------------------------------------
+function EnvPasswordHelp({ focus, onLogout }: { focus: boolean; onLogout: () => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (focus) window.setTimeout(() => ref.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 120);
+  }, [focus]);
+  return (
+    <div className="setting-group security-group" ref={ref}>
+      <div className="setting-label">Keamanan</div>
+      <p className="setting-help">Password aplikasi diatur di Vercel, supaya tidak perlu database. Cara menggantinya:</p>
+      <ol className="env-steps">
+        <li>Buka <strong>vercel.com</strong> → proyek <strong>solscreen</strong> → <strong>Settings</strong> → <strong>Environment Variables</strong>.</li>
+        <li>Tambah (atau edit) Key <code>APP_PASSWORD</code>, isi password baru Anda, lalu <strong>Save</strong>.</li>
+        <li>Buka <strong>Deployments</strong> → <strong>⋯</strong> → <strong>Redeploy</strong>. Semua perangkat akan diminta login ulang.</li>
+      </ol>
+      <div className="password-actions">
+        <button type="button" className="ghost-button" onClick={onLogout}><LogOut size={14} /> Keluar</button>
+      </div>
     </div>
   );
 }

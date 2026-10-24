@@ -2,12 +2,17 @@
 
 ## Deploy ke Vercel (gratis, tanpa kartu kredit)
 
-1. Di https://vercel.com/new pilih **Import Git Repository** → `appvena/solscreen`.
-   Pengaturan build sudah ada di `vercel.json` — biarkan default, klik **Deploy**.
-2. Proyek → **Settings → Environment Variables**: tambahkan `ANTHROPIC_API_KEY`.
-3. Proyek → **Storage → Create Database → Upstash (Redis)** → hubungkan ke proyek ini.
-   Vercel otomatis menambahkan `KV_REST_API_URL` dan `KV_REST_API_TOKEN`. Ini menyimpan password yang Anda ganti.
-4. **Deployments → Redeploy** supaya variabel baru terbaca. Buka `https://<nama-proyek>.vercel.app`, login `123456`, lalu ganti password.
+1. Di https://vercel.com/new pilih `appvena/solscreen`, Application Preset **Other**, klik **Deploy**.
+2. Proyek → **Settings → Environment Variables**, tambahkan:
+   - `ANTHROPIC_API_KEY` — key dari platform.claude.com (untuk review AI)
+   - `APP_PASSWORD` — password untuk masuk aplikasi (tanpa ini: `123456`)
+3. **Deployments → ⋯ → Redeploy**.
+
+Hanya itu. Tidak perlu database: di Vercel password dibaca dari `APP_PASSWORD`.
+Ganti password = edit `APP_PASSWORD` lalu Redeploy (semua perangkat diminta login ulang).
+
+Opsional — ingin ganti password dari dalam aplikasi? Hubungkan **Storage → Upstash (Redis)** dan jangan isi
+`APP_PASSWORD`; menu Pengaturan → Keamanan akan menampilkan form ganti password.
 
 Cara kerja: `pnpm build:vercel` membangun frontend (Vite) dan membundel API Express menjadi satu fungsi
 (`server/vercel.ts` → `.vercel/output/functions/api.func`). Lihat `scripts/build-vercel.mjs`.
@@ -30,8 +35,9 @@ Kode terkait: `server/claudeReview.ts` (prompt, skema output, rate limit), `serv
 
 ## Password aplikasi
 
-- Password awal: **123456** (atau isi `APP_DEFAULT_PASSWORD`). Setelah login, banner kuning akan meminta Anda menggantinya.
-- Ganti password: **Pengaturan alert → Keamanan** (minimal 8 karakter). Sesi lain otomatis keluar.
+- Password awal: **123456**. Setelah login, banner kuning akan meminta Anda menggantinya.
+- Jika `APP_PASSWORD` diisi (atau di Vercel tanpa Redis): password = nilai variabel itu; ganti di dashboard hosting.
+- Selain itu: ganti di **Pengaturan alert → Keamanan** (minimal 8 karakter). Sesi lain otomatis keluar.
 - Password disimpan sebagai hash:
   - **Vercel:** di Upstash Redis (key `solscreen:app-auth`). Wajib dihubungkan, karena file di Vercel tidak permanen.
   - **Docker/Railway/lokal:** di `DATA_DIR/app-auth.json` (default `./data`, di Docker `/data` — pasang volume).

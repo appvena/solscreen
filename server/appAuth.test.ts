@@ -22,6 +22,9 @@ beforeEach(() => {
   vi.stubEnv("DATA_DIR", dir);
   vi.stubEnv("APP_DEFAULT_PASSWORD", "");
   vi.stubEnv("SESSION_SECRET", "");
+  vi.stubEnv("APP_PASSWORD", "");
+  vi.stubEnv("VERCEL", "");
+  vi.stubEnv("ANTHROPIC_API_KEY", "");
   vi.stubEnv("KV_REST_API_URL", "");
   vi.stubEnv("UPSTASH_REDIS_REST_URL", "");
   setAuthStoreForTests(null);
@@ -130,10 +133,40 @@ describe("app password", () => {
     expect(getAuthStore().kind).toBe("redis");
   });
 
-  it("warns in the session payload when running on Vercel without Redis", async () => {
+  it("on Vercel without Redis: stateless 123456 that survives cold starts", async () => {
     vi.stubEnv("VERCEL", "1");
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-x");
+    const token = await createSessionToken();
+    resetAppAuthForTests(); // another serverless instance
+    expect(await verifySessionToken(token)).toBe(true);
+    expect(await verifyPassword("123456")).toBe(true);
     const session = await appRouter.createCaller((await fakeCtx()).ctx).appAuth.session();
-    expect(session.passwordPersistent).toBe(false);
+    expect(session).toMatchObject({ passwordManagedBy: "env", passwordPersistent: true });
+    expect(await changePassword("123456", "passwordbaru1")).toEqual({ ok: false, reason: "env_managed" });
+  });
+
+  it("APP_PASSWORD sets the password; changing it logs everyone out", async () => {
+    vi.stubEnv("APP_PASSWORD", "rahasiaku99");
+    const token = await createSessionToken();
+    expect(await verifyPassword("rahasiaku99")).toBe(true);
+    expect(await verifyPassword("123456")).toBe(false);
+    expect(await isUsingDefaultPassword()).toBe(false);
+    vi.stubEnv("APP_PASSWORD", "passwordlain1");
+    resetAppAuthForTests();
+    expect(await verifySessionToken(token)).toBe(false);
+    expect(await verifyPassword("passwordlain1")).toBe(true);
+  });
+
+  it("session tokens cannot be forged without knowing APP_PASSWORD", async () => {
+    vi.stubEnv("APP_PASSWORD", "rahasiaku99");
+    const real = await createSessionToken();
+    vi.stubEnv("APP_PASSWORD", "tebakan");
+    resetAppAuthForTests();
+    const forged = await createSessionToken();
+    vi.stubEnv("APP_PASSWORD", "rahasiaku99");
+    resetAppAuthForTests();
+    expect(await verifySessionToken(real)).toBe(true);
+    expect(await verifySessionToken(forged)).toBe(false);
   });
 
   it("never resets to the default password when the store is temporarily unreadable", async () => {

@@ -1,12 +1,16 @@
-import { createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { parse as parseCookie } from "cookie";
 import type { CookieOptions, Request, Response } from "express";
-import { getAuthStore, type StoredAuth } from "./authStore";
+import { getAuthStore, redisEnv, type StoredAuth } from "./authStore";
 
 // ---------------------------------------------------------------------------
-// Single shared app password.
-// - First start: password = APP_DEFAULT_PASSWORD or "123456".
-// - Changed from inside the app; stored as a scrypt hash (Redis or file, see authStore).
+// Single shared app password. Two modes:
+// - "env": the password comes from APP_PASSWORD (default "123456"). Used when
+//   APP_PASSWORD is set, or on Vercel without Redis. Stateless: every serverless
+//   instance derives the same state, so nobody gets logged out at random.
+//   To change it, edit APP_PASSWORD in the hosting dashboard and redeploy.
+// - "app": first start uses APP_DEFAULT_PASSWORD or "123456"; changed from
+//   inside the app and stored as a scrypt hash (Redis or file, see authStore).
 // - Sessions are HMAC-signed cookies; changing the password logs out every
 //   other session (the session carries the password "version").
 // ---------------------------------------------------------------------------
@@ -39,10 +43,40 @@ function freshState(password: string, isDefault: boolean, previous?: StoredAuth)
 
 const withEnvSecret = (value: StoredAuth): StoredAuth => ({ ...value, secret: process.env.SESSION_SECRET || value.secret });
 
+export type PasswordMode = "env" | "app";
+
+export function passwordMode(env: NodeJS.ProcessEnv = process.env): PasswordMode {
+  if (env.APP_PASSWORD) return "env";
+  if (redisEnv(env)) return "app";
+  if (env.VERCEL) return "env"; // no persistent storage on Vercel without Redis
+  return "app";
+}
+
+/** Deterministic state for "env" mode — identical on every instance, no storage needed. */
+function envState(): StoredAuth {
+  const password = process.env.APP_PASSWORD || DEFAULT_PASSWORD_FALLBACK;
+  const salt = createHash("sha256").update("solscreen-env-salt").digest("hex").slice(0, 32);
+  // The password is part of the signing secret, so sessions can't be forged without it,
+  // and changing APP_PASSWORD logs everyone out.
+  const key = process.env.SESSION_SECRET || process.env.ANTHROPIC_API_KEY || "solscreen";
+  return {
+    salt,
+    hash: hashPassword(password, salt),
+    version: 1,
+    secret: createHmac("sha256", key).update(`session:${password}`).digest("hex"),
+    isDefault: !process.env.APP_PASSWORD,
+    updatedAt: "env",
+  };
+}
+
 async function load(): Promise<StoredAuth> {
   if (cached && Date.now() - cached.at < CACHE_MS) return cached.value;
   if (initPromise) return initPromise;
   initPromise = (async () => {
+    if (passwordMode() === "env") {
+      cached = { value: envState(), at: Date.now(), persisted: true };
+      return cached.value;
+    }
     const store = getAuthStore();
     let value: StoredAuth | null;
     try {
@@ -86,9 +120,10 @@ export async function isUsingDefaultPassword(): Promise<boolean> {
   return (await load()).isDefault;
 }
 
-export type ChangeResult = { ok: true; persisted: boolean } | { ok: false; reason: "wrong_current" | "too_short" | "same_as_current" };
+export type ChangeResult = { ok: true; persisted: boolean } | { ok: false; reason: "wrong_current" | "too_short" | "same_as_current" | "env_managed" };
 
 export async function changePassword(current: string, next: string): Promise<ChangeResult> {
+  if (passwordMode() === "env") return { ok: false, reason: "env_managed" };
   if (!(await verifyPassword(current))) return { ok: false, reason: "wrong_current" };
   if (next.length < MIN_PASSWORD_LENGTH) return { ok: false, reason: "too_short" };
   if (next === current) return { ok: false, reason: "same_as_current" };

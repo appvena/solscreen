@@ -16,6 +16,7 @@ import {
   setSessionCookie,
   verifyPassword,
   authStorageKind,
+  passwordMode,
 } from "./appAuth";
 import {
   checkRateLimit,
@@ -44,8 +45,9 @@ export const appRouter = router({
     session: publicProcedure.query(async ({ ctx }) => ({
       authenticated: ctx.appAuthed,
       usingDefaultPassword: ctx.appAuthed ? await isUsingDefaultPassword() : false,
-      // On Vercel the filesystem is wiped, so a changed password only survives with Redis.
-      passwordPersistent: authStorageKind() === "redis" || !process.env.VERCEL,
+      // "env": set via APP_PASSWORD in the hosting dashboard; "app": changeable in the app.
+      passwordManagedBy: passwordMode(),
+      passwordPersistent: passwordMode() === "env" || authStorageKind() === "redis" || !process.env.VERCEL,
       minPasswordLength: MIN_PASSWORD_LENGTH,
     })),
 
@@ -81,6 +83,7 @@ export const appRouter = router({
         if (!result.ok) {
           const message =
             result.reason === "wrong_current" ? "Password saat ini salah." :
+            result.reason === "env_managed" ? "Password diatur lewat variabel APP_PASSWORD di hosting, bukan dari aplikasi." :
             result.reason === "too_short" ? `Password baru minimal ${MIN_PASSWORD_LENGTH} karakter.` :
             "Password baru harus berbeda dari yang sekarang.";
           throw new TRPCError({ code: "BAD_REQUEST", message });
